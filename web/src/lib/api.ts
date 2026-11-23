@@ -75,7 +75,12 @@ export interface Settings {
 }
 
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
-	const token = typeof localStorage !== 'undefined' ? localStorage.getItem('cr_steward_token') : null;
+	let token: string | null = null;
+	try {
+		token = typeof localStorage !== 'undefined' ? localStorage.getItem('cr_steward_token') : null;
+	} catch {
+		token = null;
+	}
 	const headers = new Headers(init?.headers);
 	if (token) {
 		headers.set('Authorization', `Bearer ${token}`);

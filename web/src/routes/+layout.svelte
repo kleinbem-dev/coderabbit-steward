@@ -5,28 +5,46 @@
 
 	let { children }: { children?: Snippet } = $props();
 
+	function readStoredToken(): string {
+		try {
+			return typeof localStorage !== 'undefined' ? (localStorage.getItem('cr_steward_token') ?? '') : '';
+		} catch {
+			return '';
+		}
+	}
+
 	let showToken = $state(false);
-	let tokenInput = $state(
-		typeof localStorage !== 'undefined' ? (localStorage.getItem('cr_steward_token') ?? '') : ''
-	);
+	let tokenInput = $state(readStoredToken());
+	let tokenError = $state<string | null>(null);
 
 	function saveToken(e: SubmitEvent) {
 		e.preventDefault();
+		tokenError = null;
 		const trimmed = tokenInput.trim();
-		if (trimmed) {
-			localStorage.setItem('cr_steward_token', trimmed);
-		} else {
-			localStorage.removeItem('cr_steward_token');
+		try {
+			if (trimmed) {
+				localStorage.setItem('cr_steward_token', trimmed);
+			} else {
+				localStorage.removeItem('cr_steward_token');
+			}
+			tokenInput = trimmed;
+			showToken = false;
+			location.reload();
+		} catch (err) {
+			tokenError = err instanceof Error ? err.message : 'Unable to save token to browser storage';
 		}
-		showToken = false;
-		location.reload();
 	}
 
 	function clearToken() {
-		tokenInput = '';
-		localStorage.removeItem('cr_steward_token');
-		showToken = false;
-		location.reload();
+		tokenError = null;
+		try {
+			localStorage.removeItem('cr_steward_token');
+			tokenInput = '';
+			showToken = false;
+			location.reload();
+		} catch (err) {
+			tokenError = err instanceof Error ? err.message : 'Unable to clear token from browser storage';
+		}
 	}
 </script>
 
@@ -70,6 +88,9 @@
 					</button>
 				{/if}
 			</form>
+			{#if tokenError}
+				<p class="max-w-6xl mx-auto mt-2 text-xs text-red-500">{tokenError}</p>
+			{/if}
 		</div>
 	{/if}
 
