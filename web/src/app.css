@@ -1,0 +1,4 @@
+@import "tailwindcss";
+@import "@kleinbem/web-config/theme";
+@import "@kleinbem/web-config/base.css";
+@source "../node_modules/@kleinbem/web-config";

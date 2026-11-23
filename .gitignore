@@ -1,0 +1,13 @@
+/target
+result
+result-*
+.direnv
+.envrc.local
+*.swp
+*~
+*.db
+*.db-shm
+*.db-wal
+/web/node_modules
+/web/build
+/web/.svelte-kit

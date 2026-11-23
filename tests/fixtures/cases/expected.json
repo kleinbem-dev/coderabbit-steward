@@ -1,0 +1,224 @@
+{
+  "reviewed-synthetic-label-only": {
+    "source": "kleinbem/chrome-open-in-app#15",
+    "what": "Draft review-only PR on a review/*/base branch, label at creation, base_branches config, no trigger comment",
+    "check_runs": [
+      {
+        "started_at": "2026-11-15T18:02:27Z",
+        "outcome": "reviewed"
+      }
+    ],
+    "spends": [
+      {
+        "at": "2026-11-15T18:02:27Z",
+        "cause": "pr_opened_labelled"
+      }
+    ],
+    "limit": 1,
+    "remaining_after": 0,
+    "files_processed": 2,
+    "actionable_comments": 4,
+    "probe": {
+      "asked_at": "2026-11-15T18:09:54Z",
+      "minutes_until_free": 52,
+      "next_free_at": "2026-11-15T19:02:00Z"
+    },
+    "refill_minutes": 60
+  },
+  "skipped-no-label-then-labelled": {
+    "source": "kleinbem/chrome-open-in-app#14",
+    "what": "No label: skipped. Label added: reviewed, no findings. Push after review: skipped (incremental off)",
+    "check_runs": [
+      {
+        "started_at": "2026-11-15T03:01:41Z",
+        "outcome": "skipped_label"
+      },
+      {
+        "started_at": "2026-11-15T03:05:49Z",
+        "outcome": "reviewed"
+      },
+      {
+        "started_at": "2026-11-15T03:14:14Z",
+        "outcome": "skipped_incremental"
+      }
+    ],
+    "spends": [
+      {
+        "at": "2026-11-15T03:05:49Z",
+        "cause": "label_added"
+      }
+    ],
+    "limit": 1,
+    "remaining_after": 0,
+    "actionable_comments": 0,
+    "no_actionable": true,
+    "coverage": "files changed by the last push are unreviewed"
+  },
+  "rate-limited-merged-unreviewed": {
+    "source": "kleinbem/nix-packages#318",
+    "what": "Rate-limited review passes the gate; PR merged 94 s later without a review",
+    "check_runs": [
+      {
+        "started_at": "2026-11-15T01:19:40Z",
+        "outcome": "rate_limited"
+      }
+    ],
+    "spends": [],
+    "rate_limit": {
+      "seen_at": "2026-11-15T01:19:39Z",
+      "minutes_until_free": 42,
+      "next_free_at": "2026-11-15T02:01:39Z"
+    },
+    "merged_at": "2026-11-15T01:21:13Z",
+    "coverage": "all non-excluded files of the PR are unreviewed"
+  },
+  "footer-one-per-hour": {
+    "source": "kleinbem/skills#158",
+    "what": "Reviewed, then a second request 4.5 minutes later was rate-limited",
+    "check_runs": [
+      {
+        "started_at": "2026-11-15T01:56:49Z",
+        "outcome": "reviewed"
+      },
+      {
+        "started_at": "2026-11-15T02:01:17Z",
+        "outcome": "rate_limited"
+      }
+    ],
+    "spends": [
+      {
+        "at": "2026-11-15T01:56:49Z"
+      }
+    ],
+    "limit": 1,
+    "remaining_after": 0,
+    "rate_limit": {
+      "minutes_until_free": 55
+    },
+    "refill_minutes": 60,
+    "actionable_comments": 1
+  },
+  "full-review-comment-trigger": {
+    "source": "kleinbem/coderabbit#18",
+    "what": "cr-full-review: empty-base PR, reviewed after an '@coderabbitai review' comment; bot replies 'Review finished'",
+    "check_runs": [
+      {
+        "started_at": "2026-11-15T10:52:54Z",
+        "outcome": "reviewed"
+      }
+    ],
+    "spends": [
+      {
+        "at": "2026-11-15T10:52:54Z",
+        "cause": "comment_trigger"
+      }
+    ],
+    "limit": 1,
+    "remaining_after": 0,
+    "actionable_comments": 7
+  },
+  "no-actionable-comments": {
+    "source": "kleinbem/nix-packages#308",
+    "what": "Review with no findings: no PR review object, only the summary comment",
+    "check_runs": [
+      {
+        "started_at": "2026-11-14T04:32:14Z",
+        "outcome": "reviewed"
+      }
+    ],
+    "spends": [
+      {
+        "at": "2026-11-14T04:32:14Z"
+      }
+    ],
+    "limit": 1,
+    "remaining_after": 0,
+    "actionable_comments": 0,
+    "no_actionable": true,
+    "reviews": 0
+  },
+  "reviewed-human-author-labelled": {
+    "source": "kleinbem/chrome-open-in-app#16",
+    "what": "Martin opens a labelled review-only PR; reviewed",
+    "labels": [
+      {
+        "at": "2026-11-21T00:01:27Z",
+        "by": "kleinbem"
+      }
+    ],
+    "check_runs": [
+      {
+        "started_at": "2026-11-21T00:01:39Z",
+        "outcome": "reviewed"
+      }
+    ],
+    "spends": [
+      {
+        "at": "2026-11-21T00:01:39Z",
+        "identity": "kleinbem",
+        "cause": "pr_opened_labelled"
+      }
+    ],
+    "limit": 1,
+    "remaining_after": 0,
+    "actionable_comments": 5
+  },
+  "bot-author-not-eligible": {
+    "source": "kleinbem/chrome-open-in-app#17",
+    "what": "App-authored labelled PR: skipped, bot has no seat; App comments (rate limit, review) get no reply; Martin`s @coderabbitai review gets \"Review skipped.\"",
+    "labels": [
+      {
+        "at": "2026-11-21T00:01:48Z",
+        "by": "coderabbit-steward[bot]"
+      }
+    ],
+    "check_runs": [
+      {
+        "started_at": "2026-11-21T00:01:56Z",
+        "outcome": "skipped_bot_author"
+      }
+    ],
+    "spends": [],
+    "commands_ignored_from": [
+      "coderabbit-steward[bot]"
+    ],
+    "never_reviewable": true
+  },
+  "label-by-bot-ignored-then-human": {
+    "source": "kleinbem/chrome-open-in-app#18",
+    "what": "Martin opens unlabelled PR (skipped); App adds cr-review: ignored for 15 min; Martin re-adds it: reviewed",
+    "labels": [
+      {
+        "at": "2026-11-21T01:05:30Z",
+        "by": "coderabbit-steward[bot]",
+        "effect": "none"
+      },
+      {
+        "at": "2026-11-21T01:21:32Z",
+        "by": "kleinbem",
+        "effect": "review"
+      }
+    ],
+    "check_runs": [
+      {
+        "started_at": "2026-11-21T01:05:22Z",
+        "outcome": "skipped_label",
+        "note": "superseded; only in timeline, the check-runs API returns the latest run"
+      },
+      {
+        "started_at": "2026-11-21T01:21:46Z",
+        "outcome": "reviewed"
+      }
+    ],
+    "spends": [
+      {
+        "at": "2026-11-21T01:21:46Z",
+        "identity": "kleinbem",
+        "cause": "label_added"
+      }
+    ],
+    "limit": 1,
+    "remaining_after": 0,
+    "actionable_comments": 7
+  }
+}
