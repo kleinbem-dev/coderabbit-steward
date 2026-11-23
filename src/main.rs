@@ -50,6 +50,8 @@ enum Commands {
         github_private_key_pem: Option<String>,
         #[arg(long, env = "GITHUB_TOKEN")]
         github_token: Option<String>,
+        #[arg(long, env = "CR_STEWARD_TRUST_AUTHENTIK_HEADER", default_value_t = false)]
+        trust_authentik_header: bool,
     },
     /// Check if a repository has free CodeRabbit review budget (exit 0 = free)
     Free {
@@ -117,6 +119,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             github_private_key_file,
             github_private_key_pem,
             github_token,
+            trust_authentik_header,
         } => {
             let parsed_mode = Mode::parse(&mode)?;
             let config = Config {
@@ -158,6 +161,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let state = AppState {
                 db,
                 api_token: cli.api_token,
+                trust_authentik_header,
             };
             let router = build_router(state, resolved_web);
             let listener = tokio::net::TcpListener::bind(&listen)

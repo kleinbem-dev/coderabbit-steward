@@ -18,6 +18,7 @@ use tower_http::services::{ServeDir, ServeFile};
 pub struct AppState {
     pub db: Db,
     pub api_token: Option<String>,
+    pub trust_authentik_header: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -123,10 +124,15 @@ async fn require_auth(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
 
-    let authorized = provided
+    let bearer_ok = provided
         .is_some_and(|tok| tok.as_bytes().ct_eq(expected.as_bytes()).into());
+    let authentik_ok = state.trust_authentik_header
+        && headers
+            .get("x-authentik-username")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| !v.trim().is_empty());
 
-    if authorized {
+    if bearer_ok || authentik_ok {
         next.run(req).await
     } else {
         (

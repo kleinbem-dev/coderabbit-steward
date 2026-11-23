@@ -17,8 +17,9 @@ async fn health_budget_queue_and_auth() {
 
     let router = build_router(
         AppState {
-            db,
+            db: db.clone(),
             api_token: Some("secret-token".to_string()),
+            trust_authentik_header: false,
         },
         None,
     );
@@ -89,4 +90,42 @@ async fn health_budget_queue_and_auth() {
     let q: Vec<Value> = serde_json::from_slice(&body).unwrap();
     assert_eq!(q.len(), 1);
     assert_eq!(q[0]["pr_number"], 42);
+
+    // X-Authentik-Username rejected when trust_authentik_header = false
+    let resp = build_router(
+        AppState {
+            db: db.clone(),
+            api_token: Some("secret-token".to_string()),
+            trust_authentik_header: false,
+        },
+        None,
+    )
+    .oneshot(
+        Request::get("/api/v1/budget")
+            .header("X-Authentik-Username", "martin")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // X-Authentik-Username accepted when trust_authentik_header = true
+    let resp = build_router(
+        AppState {
+            db,
+            api_token: Some("secret-token".to_string()),
+            trust_authentik_header: true,
+        },
+        None,
+    )
+    .oneshot(
+        Request::get("/api/v1/budget")
+            .header("X-Authentik-Username", "martin")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
