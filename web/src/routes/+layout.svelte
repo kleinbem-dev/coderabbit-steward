@@ -4,6 +4,30 @@
 	import { page } from '$app/state';
 
 	let { children }: { children?: Snippet } = $props();
+
+	let showToken = $state(false);
+	let tokenInput = $state(
+		typeof localStorage !== 'undefined' ? (localStorage.getItem('cr_steward_token') ?? '') : ''
+	);
+
+	function saveToken(e: SubmitEvent) {
+		e.preventDefault();
+		const trimmed = tokenInput.trim();
+		if (trimmed) {
+			localStorage.setItem('cr_steward_token', trimmed);
+		} else {
+			localStorage.removeItem('cr_steward_token');
+		}
+		showToken = false;
+		location.reload();
+	}
+
+	function clearToken() {
+		tokenInput = '';
+		localStorage.removeItem('cr_steward_token');
+		showToken = false;
+		location.reload();
+	}
 </script>
 
 <div class="min-h-screen bg-[var(--bg)] text-[var(--fg)]">
@@ -16,8 +40,38 @@
 				<a href="/settings" class:font-medium={page.url.pathname === '/settings'}>Settings</a>
 			</nav>
 		</div>
-		<span class="text-xs text-[var(--fg-muted)]">Europe/Dublin</span>
+		<div class="flex items-center gap-3 text-xs text-[var(--fg-muted)]">
+			<button
+				type="button"
+				class="px-2 py-1 rounded border border-[var(--border)] hover:text-[var(--fg)]"
+				onclick={() => (showToken = !showToken)}
+			>
+				{tokenInput.trim() ? 'API Token ✓' : 'API Token'}
+			</button>
+			<span>Europe/Dublin</span>
+		</div>
 	</header>
+
+	{#if showToken}
+		<div class="border-b border-[var(--border)] px-6 py-3">
+			<form class="max-w-6xl mx-auto flex flex-wrap items-center gap-2 text-sm" onsubmit={saveToken}>
+				<input
+					type="password"
+					bind:value={tokenInput}
+					placeholder="CR_STEWARD_API_TOKEN"
+					aria-label="API Bearer Token"
+					autocomplete="off"
+					class="flex-1 min-w-64 px-2.5 py-1 rounded border border-[var(--border)] bg-transparent"
+				/>
+				<button type="submit" class="px-3 py-1 rounded border border-[var(--border)]">Save</button>
+				{#if tokenInput.trim()}
+					<button type="button" class="px-3 py-1 rounded border border-[var(--border)]" onclick={clearToken}>
+						Clear
+					</button>
+				{/if}
+			</form>
+		</div>
+	{/if}
 
 	<main class="max-w-6xl mx-auto px-6 py-6">
 		{#if children}
