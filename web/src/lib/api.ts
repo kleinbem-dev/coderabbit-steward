@@ -48,6 +48,24 @@ export interface FindingRow {
 	created_at: string;
 }
 
+export interface UnreviewedFile {
+	path: string;
+	unreviewed_lines: number;
+	unreviewed_since: string | null;
+	priority: number;
+	risky: boolean;
+	by: string | null;
+	reviewed_commit: string | null;
+}
+
+export interface CoverageSummary {
+	repo: string;
+	percentage: number;
+	total_files: number;
+	reviewed_files: number;
+	unreviewed_files: UnreviewedFile[];
+}
+
 export interface RepoDetail {
 	repo: string;
 	stars: number;
@@ -60,6 +78,7 @@ export interface RepoDetail {
 		fleet_cooldown_until: string | null;
 		confidence: string;
 	};
+	coverage: CoverageSummary;
 	spends: SpendRow[];
 	queue: QueueRow[];
 	findings: FindingRow[];
