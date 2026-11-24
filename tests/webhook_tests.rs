@@ -196,3 +196,99 @@ async fn webhook_enqueues_rate_limited_pr_and_completes_on_review_or_merge() {
     let pr100 = all_q.iter().find(|q| q.pr_number == Some(100)).unwrap();
     assert_eq!(pr100.state, "merged-unreviewed");
 }
+
+#[tokio::test]
+async fn webhook_ignores_rerequested_and_requeues_rate_limited_triggered_pr() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_url = format!("sqlite://{}?mode=rwc", dir.path().join("wh3.db").display());
+    let db = Db::connect(&db_url).await.unwrap();
+    db.upsert_repo("kleinbem", "nix-config", "public", 1, "main")
+        .await
+        .unwrap();
+
+    let row = db
+        .enqueue_pr_if_absent("kleinbem/nix-config", 101, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(db.mark_queue_triggered_if_waiting(row.id).await.unwrap());
+
+    let secret = "test-webhook-secret";
+    let router = build_router(
+        AppState {
+            db: db.clone(),
+            api_token: None,
+            trust_authentik_header: false,
+            webhook_secret: Some(secret.to_string()),
+            ntfy: None,
+        },
+        None,
+    );
+
+    // 1. rerequested check_run must NOT complete the active queue item
+    let rereq_body = serde_json::json!({
+        "action": "rerequested",
+        "repository": { "full_name": "kleinbem/nix-config" },
+        "check_run": {
+            "id": 2001,
+            "name": "CodeRabbit",
+            "status": "completed",
+            "conclusion": "success",
+            "started_at": "2026-11-24T01:00:00Z",
+            "completed_at": "2026-11-24T01:01:00Z",
+            "output": { "title": "Finished" },
+            "app": { "slug": "coderabbitai" },
+            "pull_requests": [{ "number": 101 }]
+        }
+    })
+    .to_string();
+
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::post("/webhook")
+                .header("X-GitHub-Event", "check_run")
+                .header("X-Hub-Signature-256", sign(secret, rereq_body.as_bytes()))
+                .body(Body::from(rereq_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let active = db.list_active_queue("kleinbem/nix-config").await.unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].state, "triggered");
+
+    // 2. Rate-limited check_run returns the triggered row back to waiting
+    let rl_body = serde_json::json!({
+        "action": "completed",
+        "repository": { "full_name": "kleinbem/nix-config" },
+        "check_run": {
+            "id": 2002,
+            "name": "CodeRabbit",
+            "status": "completed",
+            "conclusion": "neutral",
+            "started_at": "2026-11-24T02:00:00Z",
+            "completed_at": "2026-11-24T02:00:05Z",
+            "output": { "title": "Review rate limited" },
+            "app": { "slug": "coderabbitai" },
+            "pull_requests": [{ "number": 101 }]
+        }
+    })
+    .to_string();
+
+    let resp = router
+        .oneshot(
+            Request::post("/webhook")
+                .header("X-GitHub-Event", "check_run")
+                .header("X-Hub-Signature-256", sign(secret, rl_body.as_bytes()))
+                .body(Body::from(rl_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let active = db.list_active_queue("kleinbem/nix-config").await.unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].state, "waiting");
+}

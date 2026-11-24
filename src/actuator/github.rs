@@ -15,14 +15,8 @@ struct AppClaims {
 }
 
 #[derive(Debug, Deserialize)]
-struct Installation {
+struct RepoInstallation {
     id: u64,
-    account: InstallationAccount,
-}
-
-#[derive(Debug, Deserialize)]
-struct InstallationAccount {
-    login: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,8 +47,9 @@ impl GitHubActuator {
         })
     }
 
-    /// Re-trigger a CodeRabbit review on a PR by removing and re-adding `cr-review`
-    /// using Martin's fine-grained PAT (E2c showed CodeRabbit ignores bot-added labels).
+    /// Re-trigger a CodeRabbit review on a PR by removing and re-adding `cr-review`.
+    /// Requires a human user PAT (`CR_STEWARD_USER_TOKEN`) because CodeRabbit intentionally
+    /// ignores label events authored by GitHub Apps to avoid bot loops.
     pub async fn retrigger_cr_review_label(&self, repo: &str, pr_number: u64) -> Result<()> {
         let token = self
             .config
@@ -94,7 +89,8 @@ impl GitHubActuator {
         Ok(())
     }
 
-    /// Create or update the advisory `cr-steward` check run on a PR head commit via the GitHub App.
+    /// Create an advisory `cr-steward` check run on a PR head commit via the GitHub App.
+    /// Uses an App installation token exclusively (the check-runs endpoint rejects PATs).
     pub async fn post_steward_check_run(
         &mut self,
         repo: &str,
@@ -104,8 +100,7 @@ impl GitHubActuator {
         status: &str,
         conclusion: Option<&str>,
     ) -> Result<()> {
-        let owner = repo.split('/').next().unwrap_or(repo);
-        let token = self.app_token_for_owner(owner).await?;
+        let token = self.installation_token_for_repo(repo).await?;
         let url = format!("{}/repos/{repo}/check-runs", self.config.github_api_base);
         let mut body = serde_json::json!({
             "name": "cr-steward",
@@ -133,8 +128,7 @@ impl GitHubActuator {
     }
 
     pub async fn get_pr_head_sha(&mut self, repo: &str, pr_number: u64) -> Result<Option<String>> {
-        let owner = repo.split('/').next().unwrap_or(repo);
-        let token = self.app_token_for_owner(owner).await?;
+        let token = self.read_token_for_repo(repo).await?;
         let url = format!("{}/repos/{repo}/pulls/{pr_number}", self.config.github_api_base);
         let resp: serde_json::Value = self
             .client
@@ -183,10 +177,15 @@ impl GitHubActuator {
             .context("failed to sign GitHub App JWT")
     }
 
-    async fn app_token_for_owner(&mut self, owner: &str) -> Result<String> {
+    async fn read_token_for_repo(&mut self, repo: &str) -> Result<String> {
         if let Some(tok) = &self.config.github_token {
             return Ok(tok.clone());
         }
+        self.installation_token_for_repo(repo).await
+    }
+
+    async fn installation_token_for_repo(&mut self, repo: &str) -> Result<String> {
+        let owner = repo.split('/').next().unwrap_or(repo);
         if let Some(cached) = self.installation_tokens.get(owner)
             && cached.fetched_at.elapsed() < Duration::from_secs(45 * 60)
         {
@@ -194,8 +193,8 @@ impl GitHubActuator {
         }
 
         let jwt = self.make_app_jwt()?;
-        let url = format!("{}/app/installations", self.config.github_api_base);
-        let installs: Vec<Installation> = self
+        let url = format!("{}/repos/{repo}/installation", self.config.github_api_base);
+        let inst: RepoInstallation = self
             .client
             .get(&url)
             .header(AUTHORIZATION, format!("Bearer {jwt}"))
@@ -206,11 +205,6 @@ impl GitHubActuator {
             .error_for_status()?
             .json()
             .await?;
-
-        let inst = installs
-            .into_iter()
-            .find(|i| i.account.login.eq_ignore_ascii_case(owner))
-            .with_context(|| format!("no GitHub App installation found for owner {owner}"))?;
 
         let tok_url = format!(
             "{}/app/installations/{}/access_tokens",

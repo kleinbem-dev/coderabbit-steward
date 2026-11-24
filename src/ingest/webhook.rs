@@ -80,6 +80,14 @@ async fn handle_check_run(
     repo: &str,
     root: &Value,
 ) -> Result<WebhookOutcome> {
+    let action = root.get("action").and_then(Value::as_str).unwrap_or("");
+    if !action.is_empty() && action != "created" && action != "completed" {
+        return Ok(WebhookOutcome {
+            ignored: true,
+            message: format!("ignored check_run action: {action}"),
+        });
+    }
+
     let Some(cr) = root.get("check_run") else {
         return Ok(WebhookOutcome {
             ignored: true,
@@ -113,54 +121,59 @@ async fn handle_check_run(
     )
     .await?;
 
-    let mut ledger = db.load_budget_ledger(repo).await?;
+    let is_completed = action.is_empty() || action == "completed";
     let now = Timestamp::now();
-    ledger.apply_check_run(
-        &outcome,
-        pr_number.and_then(|n| u64::try_from(n).ok()),
-        u64::try_from(github_id).ok(),
-        "webhook",
-        "pr-webhook",
-    );
-    db.save_budget_ledger(repo, &ledger, now).await?;
+    let ledger = db
+        .update_budget_ledger(repo, now, |ledger| {
+            if is_completed || matches!(outcome, CheckRunOutcome::InProgress { .. }) {
+                ledger.apply_check_run(
+                    &outcome,
+                    pr_number.and_then(|n| u64::try_from(n).ok()),
+                    u64::try_from(github_id).ok(),
+                    "webhook",
+                    "pr-webhook",
+                );
+            }
+        })
+        .await?;
 
-    match &outcome {
-        CheckRunOutcome::RateLimited { .. } => {
-            if let Some(pr) = pr_number {
-                let next_free = ledger.snapshot(now).next_free_at.map(|t| t.to_string());
-                if db
-                    .enqueue_pr_if_absent(repo, pr, next_free.as_deref())
-                    .await?
-                    .is_some()
-                {
-                    info!(repo, pr, "auto-enqueued rate-limited PR from check_run");
+    if is_completed {
+        match &outcome {
+            CheckRunOutcome::RateLimited { .. } => {
+                if let Some(pr) = pr_number {
+                    let next_free = ledger.snapshot(now).next_free_at.map(|t| t.to_string());
+                    if db
+                        .enqueue_pr_if_absent(repo, pr, next_free.as_deref())
+                        .await?
+                        .is_some()
+                    {
+                        info!(repo, pr, "auto-enqueued rate-limited PR from check_run");
+                    }
                 }
             }
-        }
-        CheckRunOutcome::Reviewed { .. } => {
-            if let Some(pr) = pr_number {
-                let completed = db.complete_queue_for_pr(repo, pr, "done").await?;
-                if completed > 0 {
-                    info!(repo, pr, "completed queued PR after CodeRabbit review");
+            CheckRunOutcome::Reviewed { .. } => {
+                if let Some(pr) = pr_number {
+                    let completed = db.complete_queue_for_pr(repo, pr, "done").await?;
+                    if completed > 0 {
+                        info!(repo, pr, "completed queued PR after CodeRabbit review");
+                    }
                 }
             }
-        }
-        CheckRunOutcome::Unrecognised {
-            status,
-            conclusion,
-            title,
-        } => {
-            if let Some(client) = ntfy {
-                client
-                    .send(
+            CheckRunOutcome::Unrecognised {
+                status,
+                conclusion,
+                title,
+            } => {
+                if let Some(client) = ntfy {
+                    client.send(
                         &format!("cr-steward: unrecognised check_run in {repo}"),
                         &format!("status={status}, conclusion={conclusion:?}, title={title:?}"),
                         "default",
-                    )
-                    .await;
+                    );
+                }
             }
+            _ => {}
         }
-        _ => {}
     }
 
     Ok(WebhookOutcome {
@@ -221,10 +234,12 @@ async fn handle_issue_comment(
     )
     .await?;
 
-    let mut ledger = db.load_budget_ledger(repo).await?;
     let now = Timestamp::now();
-    ledger.apply_bot_message(&msg);
-    db.save_budget_ledger(repo, &ledger, now).await?;
+    let ledger = db
+        .update_budget_ledger(repo, now, |ledger| {
+            ledger.apply_bot_message(&msg);
+        })
+        .await?;
 
     match &msg {
         BotMessage::RateLimited { .. } => {
@@ -248,13 +263,11 @@ async fn handle_issue_comment(
                     .chars()
                     .take(240)
                     .collect();
-                client
-                    .send(
-                        &format!("cr-steward: unrecognised CodeRabbit comment in {repo}"),
-                        &format!("PR #{pr_number:?}: {snippet}"),
-                        "default",
-                    )
-                    .await;
+                client.send(
+                    &format!("cr-steward: unrecognised CodeRabbit comment in {repo}"),
+                    &format!("PR #{pr_number:?}: {snippet}"),
+                    "default",
+                );
             }
         }
         _ => {}
@@ -303,10 +316,11 @@ async fn handle_pr_review(
     )
     .await?;
 
-    let mut ledger = db.load_budget_ledger(repo).await?;
     let now = Timestamp::now();
-    ledger.apply_bot_message(&msg);
-    db.save_budget_ledger(repo, &ledger, now).await?;
+    db.update_budget_ledger(repo, now, |ledger| {
+        ledger.apply_bot_message(&msg);
+    })
+    .await?;
 
     match &msg {
         BotMessage::ReviewSummary { .. } | BotMessage::ReviewFinished { .. } => {
@@ -319,13 +333,11 @@ async fn handle_pr_review(
         }
         BotMessage::Unrecognised { .. } => {
             if let Some(client) = ntfy {
-                client
-                    .send(
-                        &format!("cr-steward: unrecognised CodeRabbit review in {repo}"),
-                        &format!("PR #{pr_number:?}"),
-                        "default",
-                    )
-                    .await;
+                client.send(
+                    &format!("cr-steward: unrecognised CodeRabbit review in {repo}"),
+                    &format!("PR #{pr_number:?}"),
+                    "default",
+                );
             }
         }
         _ => {}

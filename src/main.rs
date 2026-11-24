@@ -351,6 +351,7 @@ async fn run_scheduler_tick(
         let on_demand_queue: Vec<QueueCandidate> = active
             .iter()
             .filter(|q| q.state == "waiting" && q.kind == "on-demand")
+            .filter(|q| q.pr_number.is_some())
             .filter(|q| {
                 q.not_before
                     .as_deref()
@@ -389,16 +390,14 @@ async fn run_scheduler_tick(
                     warn!(repo = %full, queue_id = q.id, pr = ?q.pr_number, "pending trigger timed out after 15m");
                     db.update_queue_state(q.id, "timeout", None).await?;
                     if let Some(client) = ntfy {
-                        client
-                            .send(
-                                &format!("cr-steward: stuck trigger in {full}"),
-                                &format!(
-                                    "Queue item {} (PR {:?}) stayed in triggered state for >15m without a CodeRabbit response.",
-                                    q.id, q.pr_number
-                                ),
-                                "high",
-                            )
-                            .await;
+                        client.send(
+                            &format!("cr-steward: stuck trigger in {full}"),
+                            &format!(
+                                "Queue item {} (PR {:?}) stayed in triggered state for >15m without a CodeRabbit response.",
+                                q.id, q.pr_number
+                            ),
+                            "high",
+                        );
                     }
                 }
             }
@@ -409,39 +408,38 @@ async fn run_scheduler_tick(
                 info!(repo = %full, queue_id, pr, "triggering queued on-demand CodeRabbit review");
                 match actuator.retrigger_cr_review_label(&full, pr).await {
                     Ok(()) => {
-                        db.update_queue_state(queue_id, "triggered", None).await?;
-                        match actuator.get_pr_head_sha(&full, pr).await {
-                            Ok(Some(sha)) => {
-                                if let Err(err) = actuator
-                                    .post_steward_check_run(
-                                        &full,
-                                        &sha,
-                                        "Re-triggered CodeRabbit review",
-                                        "Budget became free; re-applied `cr-review` label.",
-                                        "in_progress",
-                                        None,
-                                    )
-                                    .await
-                                {
-                                    warn!(repo = %full, pr, error = %err, "failed to post cr-steward check run");
+                        if db.mark_queue_triggered_if_waiting(queue_id).await? {
+                            match actuator.get_pr_head_sha(&full, pr).await {
+                                Ok(Some(sha)) => {
+                                    if let Err(err) = actuator
+                                        .post_steward_check_run(
+                                            &full,
+                                            &sha,
+                                            "Re-triggered CodeRabbit review",
+                                            "Budget became free; re-applied `cr-review` label.",
+                                            "completed",
+                                            Some("neutral"),
+                                        )
+                                        .await
+                                    {
+                                        warn!(repo = %full, pr, error = %err, "failed to post cr-steward check run");
+                                    }
                                 }
-                            }
-                            Ok(None) => {}
-                            Err(err) => {
-                                warn!(repo = %full, pr, error = %err, "failed to fetch PR head sha");
+                                Ok(None) => {}
+                                Err(err) => {
+                                    warn!(repo = %full, pr, error = %err, "failed to fetch PR head sha");
+                                }
                             }
                         }
                     }
                     Err(err) => {
                         error!(repo = %full, queue_id, pr, error = %err, "failed to re-trigger cr-review label");
                         if let Some(client) = ntfy {
-                            client
-                                .send(
-                                    &format!("cr-steward: re-trigger failed in {full}#{pr}"),
-                                    &format!("{err:#}"),
-                                    "high",
-                                )
-                                .await;
+                            client.send(
+                                &format!("cr-steward: re-trigger failed in {full}#{pr}"),
+                                &format!("{err:#}"),
+                                "high",
+                            );
                         }
                     }
                 }

@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{FromRow, SqlitePool};
 use std::str::FromStr;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 pub fn now_rfc3339() -> String {
     Timestamp::now().to_string()
@@ -14,6 +16,7 @@ pub fn now_rfc3339() -> String {
 #[derive(Clone)]
 pub struct Db {
     pub pool: SqlitePool,
+    ledger_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -114,7 +117,10 @@ impl Db {
             .run(&pool)
             .await
             .context("failed to run migrations")?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            ledger_lock: Arc::new(Mutex::new(())),
+        })
     }
 
     pub async fn upsert_repo(
@@ -238,6 +244,24 @@ impl Db {
                 });
             }
         }
+        Ok(ledger)
+    }
+
+    /// Serialise load-modify-save of a repo's budget ledger so concurrent webhook deliveries
+    /// cannot clobber each other's throttle deadlines.
+    pub async fn update_budget_ledger<F>(
+        &self,
+        repo: &str,
+        now: Timestamp,
+        mutate: F,
+    ) -> Result<BudgetLedger>
+    where
+        F: FnOnce(&mut BudgetLedger),
+    {
+        let _guard = self.ledger_lock.lock().await;
+        let mut ledger = self.load_budget_ledger(repo).await?;
+        mutate(&mut ledger);
+        self.save_budget_ledger(repo, &ledger, now).await?;
         Ok(ledger)
     }
 
@@ -413,47 +437,60 @@ impl Db {
         not_before: Option<&str>,
     ) -> Result<Option<QueueRow>> {
         let now = now_rfc3339();
-        let existing: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM queue
-             WHERE repo = ?1 AND pr_number = ?2 AND state IN ('waiting', 'triggered')
-             LIMIT 1",
-        )
-        .bind(repo)
-        .bind(pr_number)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        if let Some(id) = existing {
-            if let Some(nb) = not_before {
-                sqlx::query("UPDATE queue SET not_before = ?1, updated_at = ?2 WHERE id = ?3")
-                    .bind(nb)
-                    .bind(&now)
-                    .bind(id)
-                    .execute(&self.pool)
-                    .await?;
-            }
-            return Ok(None);
-        }
-
-        let id = sqlx::query_scalar::<_, i64>(
+        let inserted_id: Option<i64> = sqlx::query_scalar(
             "INSERT INTO queue (repo, kind, pr_number, state, not_before, created_at, updated_at)
-             VALUES (?1, 'on-demand', ?2, 'waiting', ?3, ?4, ?4) RETURNING id",
+             SELECT ?1, 'on-demand', ?2, 'waiting', ?3, ?4, ?4
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM queue
+                 WHERE repo = ?1 AND pr_number = ?2 AND state IN ('waiting', 'triggered')
+             )
+             RETURNING id",
         )
         .bind(repo)
         .bind(pr_number)
         .bind(not_before)
         .bind(&now)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
 
-        let row = sqlx::query_as::<_, QueueRow>(
-            "SELECT id, repo, kind, pr_number, paths_json, priority, state, not_before, created_at, updated_at
-             FROM queue WHERE id = ?1",
+        if let Some(id) = inserted_id {
+            let row = sqlx::query_as::<_, QueueRow>(
+                "SELECT id, repo, kind, pr_number, paths_json, priority, state, not_before, created_at, updated_at
+                 FROM queue WHERE id = ?1",
+            )
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
+            return Ok(Some(row));
+        }
+
+        // Return any rate-limited `triggered` row back to `waiting` so the scheduler retries it.
+        sqlx::query(
+            "UPDATE queue
+             SET state = 'waiting',
+                 not_before = COALESCE(?1, not_before),
+                 updated_at = ?2
+             WHERE repo = ?3 AND pr_number = ?4 AND state IN ('waiting', 'triggered')",
         )
-        .bind(id)
-        .fetch_one(&self.pool)
+        .bind(not_before)
+        .bind(&now)
+        .bind(repo)
+        .bind(pr_number)
+        .execute(&self.pool)
         .await?;
-        Ok(Some(row))
+        Ok(None)
+    }
+
+    pub async fn mark_queue_triggered_if_waiting(&self, id: i64) -> Result<bool> {
+        let now = now_rfc3339();
+        let res = sqlx::query(
+            "UPDATE queue SET state = 'triggered', updated_at = ?1 WHERE id = ?2 AND state = 'waiting'",
+        )
+        .bind(&now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
     }
 
     pub async fn update_queue_state(
