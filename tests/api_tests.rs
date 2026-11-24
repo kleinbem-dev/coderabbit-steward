@@ -20,6 +20,8 @@ async fn health_budget_queue_and_auth() {
             db: db.clone(),
             api_token: Some("secret-token".to_string()),
             trust_authentik_header: false,
+            webhook_secret: None,
+            ntfy: None,
         },
         None,
     );
@@ -97,6 +99,8 @@ async fn health_budget_queue_and_auth() {
             db: db.clone(),
             api_token: Some("secret-token".to_string()),
             trust_authentik_header: false,
+            webhook_secret: None,
+            ntfy: None,
         },
         None,
     )
@@ -116,6 +120,8 @@ async fn health_budget_queue_and_auth() {
             db,
             api_token: Some("secret-token".to_string()),
             trust_authentik_header: true,
+            webhook_secret: None,
+            ntfy: None,
         },
         None,
     )

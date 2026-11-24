@@ -1,6 +1,9 @@
+use crate::actuator::ntfy::NtfyClient;
 use crate::budget::BudgetSnapshot;
 use crate::config::Mode;
 use crate::db::{Db, FindingRow, QueueRow, SpendRow};
+use crate::ingest::webhook::{handle_webhook_event, verify_signature};
+use axum::body::Bytes;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -19,6 +22,8 @@ pub struct AppState {
     pub db: Db,
     pub api_token: Option<String>,
     pub trust_authentik_header: bool,
+    pub webhook_secret: Option<String>,
+    pub ntfy: Option<NtfyClient>,
 }
 
 #[derive(Debug, Serialize)]
@@ -93,6 +98,7 @@ pub fn build_router(state: AppState, web_dir: Option<PathBuf>) -> Router {
     let mut router = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
+        .route("/webhook", post(post_webhook))
         .merge(protected)
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -148,6 +154,50 @@ async fn health() -> impl IntoResponse {
         "status": "healthy",
         "service": "coderabbit-steward"
     }))
+}
+
+async fn post_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(secret) = state.webhook_secret.as_deref().filter(|s| !s.is_empty()) else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "webhook secret not configured" })),
+        ));
+    };
+
+    let sig = headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !verify_signature(secret, sig, &body) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "invalid webhook signature" })),
+        ));
+    }
+
+    let event = headers
+        .get("x-github-event")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+
+    let outcome = handle_webhook_event(&state.db, state.ntfy.as_ref(), event, &body)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "ignored": outcome.ignored,
+        "message": outcome.message,
+    })))
 }
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {

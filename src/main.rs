@@ -1,15 +1,19 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use coderabbit_steward::actuator::github::GitHubActuator;
+use coderabbit_steward::actuator::ntfy::NtfyClient;
 use coderabbit_steward::api::{AppState, build_router};
 use coderabbit_steward::budget::BudgetSnapshot;
 use coderabbit_steward::config::{Config, Mode, resolve_web_dir};
 use coderabbit_steward::db::Db;
 use coderabbit_steward::ingest::poll::GitHubPoller;
+use coderabbit_steward::scheduler::{QueueCandidate, RepoScheduleInput, ScheduledAction, decide};
 use jiff::tz::TimeZone;
+use jiff::{SignedDuration, Timestamp};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 #[derive(Parser)]
 #[command(name = "cr-steward", version, about = "CodeRabbit OSS budget and review steward")]
@@ -26,33 +30,44 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Args)]
+struct DaemonArgs {
+    #[arg(long, env = "CR_STEWARD_LISTEN", default_value = "127.0.0.1:8484")]
+    listen: String,
+    #[arg(long, env = "DATABASE_URL", default_value = "sqlite://coderabbit-steward.db?mode=rwc")]
+    database_url: String,
+    #[arg(long, env = "CR_STEWARD_WEB_DIR")]
+    web_dir: Option<PathBuf>,
+    #[arg(long, env = "CR_STEWARD_MODE", default_value = "observe")]
+    mode: String,
+    #[arg(long, env = "CR_STEWARD_POLL_INTERVAL_SECS", default_value_t = 60)]
+    poll_interval_secs: u64,
+    #[arg(long, env = "CR_STEWARD_OWNERS", value_delimiter = ',', default_value = "kleinbem,kleinbem-dev")]
+    owners: Vec<String>,
+    #[arg(long, env = "GITHUB_APP_ID")]
+    github_app_id: Option<u64>,
+    #[arg(long, env = "GITHUB_APP_PRIVATE_KEY_FILE")]
+    github_private_key_file: Option<PathBuf>,
+    #[arg(long, env = "GITHUB_APP_PRIVATE_KEY")]
+    github_private_key_pem: Option<String>,
+    #[arg(long, env = "GITHUB_TOKEN")]
+    github_token: Option<String>,
+    #[arg(long, env = "CR_STEWARD_USER_TOKEN")]
+    github_user_token: Option<String>,
+    #[arg(long, env = "GITHUB_WEBHOOK_SECRET")]
+    github_webhook_secret: Option<String>,
+    #[arg(long, env = "CR_STEWARD_NTFY_URL")]
+    ntfy_url: Option<String>,
+    #[arg(long, env = "CR_STEWARD_NTFY_TOKEN")]
+    ntfy_token: Option<String>,
+    #[arg(long, env = "CR_STEWARD_TRUST_AUTHENTIK_HEADER", default_value_t = false)]
+    trust_authentik_header: bool,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Run the HTTP server, poller, and scheduler daemon
-    Daemon {
-        #[arg(long, env = "CR_STEWARD_LISTEN", default_value = "127.0.0.1:8484")]
-        listen: String,
-        #[arg(long, env = "DATABASE_URL", default_value = "sqlite://coderabbit-steward.db?mode=rwc")]
-        database_url: String,
-        #[arg(long, env = "CR_STEWARD_WEB_DIR")]
-        web_dir: Option<PathBuf>,
-        #[arg(long, env = "CR_STEWARD_MODE", default_value = "observe")]
-        mode: String,
-        #[arg(long, env = "CR_STEWARD_POLL_INTERVAL_SECS", default_value_t = 60)]
-        poll_interval_secs: u64,
-        #[arg(long, env = "CR_STEWARD_OWNERS", value_delimiter = ',', default_value = "kleinbem,kleinbem-dev")]
-        owners: Vec<String>,
-        #[arg(long, env = "GITHUB_APP_ID")]
-        github_app_id: Option<u64>,
-        #[arg(long, env = "GITHUB_APP_PRIVATE_KEY_FILE")]
-        github_private_key_file: Option<PathBuf>,
-        #[arg(long, env = "GITHUB_APP_PRIVATE_KEY")]
-        github_private_key_pem: Option<String>,
-        #[arg(long, env = "GITHUB_TOKEN")]
-        github_token: Option<String>,
-        #[arg(long, env = "CR_STEWARD_TRUST_AUTHENTIK_HEADER", default_value_t = false)]
-        trust_authentik_header: bool,
-    },
+    Daemon(Box<DaemonArgs>),
     /// Check if a repository has free CodeRabbit review budget (exit 0 = free)
     Free {
         /// Repository in owner/name format
@@ -108,19 +123,24 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
-        Commands::Daemon {
-            listen,
-            database_url,
-            web_dir,
-            mode,
-            poll_interval_secs,
-            owners,
-            github_app_id,
-            github_private_key_file,
-            github_private_key_pem,
-            github_token,
-            trust_authentik_header,
-        } => {
+        Commands::Daemon(args) => {
+            let DaemonArgs {
+                listen,
+                database_url,
+                web_dir,
+                mode,
+                poll_interval_secs,
+                owners,
+                github_app_id,
+                github_private_key_file,
+                github_private_key_pem,
+                github_token,
+                github_user_token,
+                github_webhook_secret,
+                ntfy_url,
+                ntfy_token,
+                trust_authentik_header,
+            } = *args;
             let parsed_mode = Mode::parse(&mode)?;
             let config = Config {
                 listen: listen.clone(),
@@ -133,17 +153,27 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 github_private_key_path: github_private_key_file,
                 github_private_key_pem,
                 github_token,
+                github_user_token,
+                github_webhook_secret: github_webhook_secret.clone(),
                 api_token: cli.api_token.clone(),
+                ntfy_url: ntfy_url.clone(),
+                ntfy_token: ntfy_token.clone(),
                 ..Config::default()
             };
 
             let db = Db::connect(&database_url).await?;
             db.set_mode(parsed_mode).await?;
             let resolved_web = resolve_web_dir(config.web_dir.as_ref());
+            let ntfy = ntfy_url
+                .filter(|u| !u.trim().is_empty())
+                .map(|url| NtfyClient::new(url, ntfy_token))
+                .transpose()?;
             info!(
                 listen = %config.listen,
                 mode = %config.mode.as_str(),
                 web_dir = ?resolved_web,
+                webhook_enabled = github_webhook_secret.as_deref().is_some_and(|s| !s.is_empty()),
+                ntfy_enabled = ntfy.is_some(),
                 "starting cr-steward daemon"
             );
 
@@ -158,10 +188,27 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 }
             });
 
+            let mut actuator = GitHubActuator::new(config.clone())?;
+            let sched_db = db.clone();
+            let sched_ntfy = ntfy.clone();
+            tokio::spawn(async move {
+                let tick = Duration::from_secs(60);
+                loop {
+                    tokio::time::sleep(tick).await;
+                    if let Err(err) =
+                        run_scheduler_tick(&sched_db, &mut actuator, sched_ntfy.as_ref()).await
+                    {
+                        error!(error = %err, "scheduler tick error");
+                    }
+                }
+            });
+
             let state = AppState {
                 db,
                 api_token: cli.api_token,
                 trust_authentik_header,
+                webhook_secret: github_webhook_secret,
+                ntfy,
             };
             let router = build_router(state, resolved_web);
             let listener = tokio::net::TcpListener::bind(&listen)
@@ -274,6 +321,149 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+async fn run_scheduler_tick(
+    db: &Db,
+    actuator: &mut GitHubActuator,
+    ntfy: Option<&NtfyClient>,
+) -> Result<()> {
+    let settings = db.get_settings().await?;
+    let mode = Mode::parse(&settings.mode).unwrap_or(Mode::Observe);
+    let repos = db.list_repos().await?;
+    let now = Timestamp::now();
+    let timeout_cutoff = now - SignedDuration::from_mins(15);
+
+    for repo in repos {
+        let full = format!("{}/{}", repo.owner, repo.name);
+        let ledger = db.load_budget_ledger(&full).await?;
+        let snap = ledger.snapshot(now);
+        let active = db.list_active_queue(&full).await?;
+
+        let triggered = active.iter().find(|q| q.state == "triggered");
+        let has_pending_trigger = triggered.is_some();
+        let pending_timed_out = triggered.is_some_and(|q| {
+            q.updated_at
+                .parse::<Timestamp>()
+                .is_ok_and(|ts| ts < timeout_cutoff)
+        });
+
+        let on_demand_queue: Vec<QueueCandidate> = active
+            .iter()
+            .filter(|q| q.state == "waiting" && q.kind == "on-demand")
+            .filter(|q| {
+                q.not_before
+                    .as_deref()
+                    .and_then(|s| s.parse::<Timestamp>().ok())
+                    .is_none_or(|nb| nb <= now)
+            })
+            .map(|q| QueueCandidate {
+                id: q.id,
+                pr_number: q.pr_number.and_then(|n| u64::try_from(n).ok()),
+                risky_paths: q.priority > 0,
+                created_at: q.created_at.parse::<Timestamp>().unwrap_or(now),
+            })
+            .collect();
+
+        let input = RepoScheduleInput {
+            repo: full.clone(),
+            mode,
+            budget: snap,
+            has_pending_trigger,
+            pending_timed_out,
+            on_demand_queue,
+            quiet_for_minutes: 0,
+            required_quiet_minutes: u32::try_from(settings.quiet_minutes.max(0)).unwrap_or(30),
+            predicted_demand: 0.0,
+            open_unlabelled_risky_pr: false,
+            proactive_today_repo: 0,
+            repo_daily_cap: u32::try_from(settings.repo_daily_cap.max(0)).unwrap_or(1),
+            proactive_today_fleet: 0,
+            fleet_daily_cap: u32::try_from(settings.fleet_daily_cap.max(0)).unwrap_or(4),
+            has_proactive_candidate: false,
+        };
+
+        match decide(&input) {
+            ScheduledAction::TimeoutPending => {
+                if let Some(q) = triggered {
+                    warn!(repo = %full, queue_id = q.id, pr = ?q.pr_number, "pending trigger timed out after 15m");
+                    db.update_queue_state(q.id, "timeout", None).await?;
+                    if let Some(client) = ntfy {
+                        client
+                            .send(
+                                &format!("cr-steward: stuck trigger in {full}"),
+                                &format!(
+                                    "Queue item {} (PR {:?}) stayed in triggered state for >15m without a CodeRabbit response.",
+                                    q.id, q.pr_number
+                                ),
+                                "high",
+                            )
+                            .await;
+                    }
+                }
+            }
+            ScheduledAction::TriggerOnDemand {
+                queue_id,
+                pr_number: Some(pr),
+            } => {
+                info!(repo = %full, queue_id, pr, "triggering queued on-demand CodeRabbit review");
+                match actuator.retrigger_cr_review_label(&full, pr).await {
+                    Ok(()) => {
+                        db.update_queue_state(queue_id, "triggered", None).await?;
+                        match actuator.get_pr_head_sha(&full, pr).await {
+                            Ok(Some(sha)) => {
+                                if let Err(err) = actuator
+                                    .post_steward_check_run(
+                                        &full,
+                                        &sha,
+                                        "Re-triggered CodeRabbit review",
+                                        "Budget became free; re-applied `cr-review` label.",
+                                        "in_progress",
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    warn!(repo = %full, pr, error = %err, "failed to post cr-steward check run");
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                warn!(repo = %full, pr, error = %err, "failed to fetch PR head sha");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        error!(repo = %full, queue_id, pr, error = %err, "failed to re-trigger cr-review label");
+                        if let Some(client) = ntfy {
+                            client
+                                .send(
+                                    &format!("cr-steward: re-trigger failed in {full}#{pr}"),
+                                    &format!("{err:#}"),
+                                    "high",
+                                )
+                                .await;
+                        }
+                    }
+                }
+            }
+            ScheduledAction::TriggerOnDemand {
+                queue_id,
+                pr_number: None,
+            } => {
+                warn!(repo = %full, queue_id, "on-demand queue item missing pr_number");
+            }
+            ScheduledAction::WaitPending => {
+                debug!(repo = %full, "waiting on pending trigger");
+            }
+            ScheduledAction::Idle { reason } => {
+                debug!(repo = %full, %reason, "scheduler idle");
+            }
+            ScheduledAction::TriggerProactive => {
+                debug!(repo = %full, "proactive trigger deferred to Phase 3");
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn shutdown_signal() {

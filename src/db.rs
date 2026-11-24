@@ -393,6 +393,115 @@ impl Db {
         Ok(rows)
     }
 
+    pub async fn list_active_queue(&self, repo: &str) -> Result<Vec<QueueRow>> {
+        let rows = sqlx::query_as::<_, QueueRow>(
+            "SELECT id, repo, kind, pr_number, paths_json, priority, state, not_before, created_at, updated_at
+             FROM queue
+             WHERE repo = ?1 AND state IN ('waiting', 'triggered')
+             ORDER BY priority DESC, id ASC",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn enqueue_pr_if_absent(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        not_before: Option<&str>,
+    ) -> Result<Option<QueueRow>> {
+        let now = now_rfc3339();
+        let existing: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM queue
+             WHERE repo = ?1 AND pr_number = ?2 AND state IN ('waiting', 'triggered')
+             LIMIT 1",
+        )
+        .bind(repo)
+        .bind(pr_number)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(id) = existing {
+            if let Some(nb) = not_before {
+                sqlx::query("UPDATE queue SET not_before = ?1, updated_at = ?2 WHERE id = ?3")
+                    .bind(nb)
+                    .bind(&now)
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await?;
+            }
+            return Ok(None);
+        }
+
+        let id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO queue (repo, kind, pr_number, state, not_before, created_at, updated_at)
+             VALUES (?1, 'on-demand', ?2, 'waiting', ?3, ?4, ?4) RETURNING id",
+        )
+        .bind(repo)
+        .bind(pr_number)
+        .bind(not_before)
+        .bind(&now)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let row = sqlx::query_as::<_, QueueRow>(
+            "SELECT id, repo, kind, pr_number, paths_json, priority, state, not_before, created_at, updated_at
+             FROM queue WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(Some(row))
+    }
+
+    pub async fn update_queue_state(
+        &self,
+        id: i64,
+        state: &str,
+        not_before: Option<&str>,
+    ) -> Result<()> {
+        let now = now_rfc3339();
+        if let Some(nb) = not_before {
+            sqlx::query("UPDATE queue SET state = ?1, not_before = ?2, updated_at = ?3 WHERE id = ?4")
+                .bind(state)
+                .bind(nb)
+                .bind(&now)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        } else {
+            sqlx::query("UPDATE queue SET state = ?1, updated_at = ?2 WHERE id = ?3")
+                .bind(state)
+                .bind(&now)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn complete_queue_for_pr(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        state: &str,
+    ) -> Result<u64> {
+        let now = now_rfc3339();
+        let res = sqlx::query(
+            "UPDATE queue SET state = ?1, updated_at = ?2
+             WHERE repo = ?3 AND pr_number = ?4 AND state IN ('waiting', 'triggered')",
+        )
+        .bind(state)
+        .bind(&now)
+        .bind(repo)
+        .bind(pr_number)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     pub async fn list_findings(
         &self,
         repo: Option<&str>,
