@@ -744,4 +744,59 @@ impl Db {
             .await?;
         Ok(())
     }
+
+    /// Persist coverage deletions, upserts, and scan cursor advancement atomically in one transaction.
+    pub async fn commit_coverage_batch(
+        &self,
+        repo: &str,
+        deleted_paths: &[String],
+        upserts: &[FileCoverageState],
+        new_cursor: Option<&str>,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for path in deleted_paths {
+            sqlx::query("DELETE FROM file_coverage WHERE repo = ?1 AND path = ?2")
+                .bind(repo)
+                .bind(path)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for state in upserts {
+            sqlx::query(
+                "INSERT INTO file_coverage (repo, path, reviewed_blob, reviewed_commit, by, unreviewed_lines, unreviewed_since, excluded)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(repo, path) DO UPDATE SET
+                   reviewed_blob = excluded.reviewed_blob,
+                   reviewed_commit = excluded.reviewed_commit,
+                   by = excluded.by,
+                   unreviewed_lines = excluded.unreviewed_lines,
+                   unreviewed_since = excluded.unreviewed_since,
+                   excluded = excluded.excluded",
+            )
+            .bind(repo)
+            .bind(&state.path)
+            .bind(&state.reviewed_blob)
+            .bind(&state.reviewed_commit)
+            .bind(&state.by)
+            .bind(state.unreviewed_lines)
+            .bind(&state.unreviewed_since)
+            .bind(if state.excluded { 1 } else { 0 })
+            .execute(&mut *tx)
+            .await?;
+        }
+        if let Some(sha) = new_cursor {
+            let now = now_rfc3339();
+            sqlx::query(
+                "INSERT INTO scan_cursor (repo, scanned_through, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(repo) DO UPDATE SET scanned_through = excluded.scanned_through, updated_at = excluded.updated_at",
+            )
+            .bind(repo)
+            .bind(sha)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
 }
