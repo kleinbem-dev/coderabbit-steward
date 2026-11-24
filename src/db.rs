@@ -1,5 +1,6 @@
 use crate::budget::{BudgetLedger, Confidence, SpendRecord, SpendState};
 use crate::config::Mode;
+use crate::coverage::FileCoverageState;
 use anyhow::{Context, Result};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -653,6 +654,94 @@ impl Db {
         .bind(&now)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    pub async fn get_scan_cursor(&self, repo: &str) -> Result<Option<String>> {
+        let sha = sqlx::query_scalar("SELECT scanned_through FROM scan_cursor WHERE repo = ?1")
+            .bind(repo)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(sha)
+    }
+
+    pub async fn set_scan_cursor(&self, repo: &str, sha: &str) -> Result<()> {
+        let now = now_rfc3339();
+        sqlx::query(
+            "INSERT INTO scan_cursor (repo, scanned_through, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(repo) DO UPDATE SET scanned_through = excluded.scanned_through, updated_at = excluded.updated_at",
+        )
+        .bind(repo)
+        .bind(sha)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_file_coverage(&self, repo: &str) -> Result<Vec<FileCoverageState>> {
+        #[derive(FromRow)]
+        struct RawRow {
+            path: String,
+            reviewed_blob: Option<String>,
+            reviewed_commit: Option<String>,
+            by: Option<String>,
+            unreviewed_lines: i64,
+            unreviewed_since: Option<String>,
+            excluded: i64,
+        }
+        let rows = sqlx::query_as::<_, RawRow>(
+            "SELECT path, reviewed_blob, reviewed_commit, by, unreviewed_lines, unreviewed_since, excluded
+             FROM file_coverage WHERE repo = ?1 ORDER BY path",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| FileCoverageState {
+                path: r.path,
+                reviewed_blob: r.reviewed_blob,
+                reviewed_commit: r.reviewed_commit,
+                by: r.by,
+                unreviewed_lines: r.unreviewed_lines,
+                unreviewed_since: r.unreviewed_since,
+                excluded: r.excluded != 0,
+            })
+            .collect())
+    }
+
+    pub async fn upsert_file_coverage(&self, repo: &str, state: &FileCoverageState) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO file_coverage (repo, path, reviewed_blob, reviewed_commit, by, unreviewed_lines, unreviewed_since, excluded)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(repo, path) DO UPDATE SET
+               reviewed_blob = excluded.reviewed_blob,
+               reviewed_commit = excluded.reviewed_commit,
+               by = excluded.by,
+               unreviewed_lines = excluded.unreviewed_lines,
+               unreviewed_since = excluded.unreviewed_since,
+               excluded = excluded.excluded",
+        )
+        .bind(repo)
+        .bind(&state.path)
+        .bind(&state.reviewed_blob)
+        .bind(&state.reviewed_commit)
+        .bind(&state.by)
+        .bind(state.unreviewed_lines)
+        .bind(&state.unreviewed_since)
+        .bind(if state.excluded { 1 } else { 0 })
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_file_coverage(&self, repo: &str, path: &str) -> Result<()> {
+        sqlx::query("DELETE FROM file_coverage WHERE repo = ?1 AND path = ?2")
+            .bind(repo)
+            .bind(path)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 }

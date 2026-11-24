@@ -1,6 +1,7 @@
 use crate::actuator::ntfy::NtfyClient;
 use crate::budget::BudgetSnapshot;
 use crate::config::Mode;
+use crate::coverage::{self, CoverageSummary};
 use crate::db::{Db, FindingRow, QueueRow, SpendRow};
 use crate::ingest::webhook::{handle_webhook_event, verify_signature};
 use axum::body::Bytes;
@@ -48,6 +49,7 @@ pub struct RepoDetailResponse {
     pub repo: String,
     pub stars: i64,
     pub budget: BudgetSnapshot,
+    pub coverage: CoverageSummary,
     pub spends: Vec<SpendRow>,
     pub queue: Vec<QueueRow>,
     pub findings: Vec<FindingRow>,
@@ -266,6 +268,12 @@ async fn get_fleet_budget(
             .iter()
             .filter(|f| f.repo == full && (f.status == "new" || f.status == "real" || f.status == "needs-martin"))
             .count();
+        let cov_files = state
+            .db
+            .list_file_coverage(&full)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let cov_pct = coverage::summarize(&full, &cov_files, now).percentage;
 
         out.push(FleetRepoBudget {
             repo: full,
@@ -279,7 +287,7 @@ async fn get_fleet_budget(
             next_free_at: snap.next_free_at.map(|t| t.to_string()),
             confidence: snap.confidence.as_str().to_string(),
             queue_length: q_len,
-            coverage_pct: 0.0,
+            coverage_pct: cov_pct,
             open_findings: open_f,
         });
     }
@@ -336,11 +344,18 @@ async fn get_repo_detail(
         .list_findings(Some(&full), None)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let cov_files = state
+        .db
+        .list_file_coverage(&full)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let now = Timestamp::now();
 
     Ok(Json(RepoDetailResponse {
-        repo: full,
+        repo: full.clone(),
         stars,
-        budget: ledger.snapshot(Timestamp::now()),
+        budget: ledger.snapshot(now),
+        coverage: coverage::summarize(&full, &cov_files, now),
         spends,
         queue,
         findings,
@@ -379,13 +394,16 @@ async fn get_queue(
 }
 
 async fn get_coverage(
+    State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
-) -> impl IntoResponse {
-    Json(serde_json::json!({
-        "repo": format!("{owner}/{repo}"),
-        "percentage": 0.0,
-        "unreviewed_files": []
-    }))
+) -> Result<Json<CoverageSummary>, (StatusCode, String)> {
+    let full = format!("{owner}/{repo}");
+    let files = state
+        .db
+        .list_file_coverage(&full)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(coverage::summarize(&full, &files, Timestamp::now())))
 }
 
 async fn get_findings(

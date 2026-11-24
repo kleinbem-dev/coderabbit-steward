@@ -1,6 +1,9 @@
 use crate::config::Config;
+use crate::coverage::{
+    CommitFileChange, CommitVerdict, FileCoverageState, apply_commit_changes, is_excluded_path,
+};
 use crate::db::Db;
-use crate::parse::check_run::parse_check_run;
+use crate::parse::check_run::{CheckRunOutcome, parse_check_run};
 use crate::parse::comment::{BotMessage, parse_issue_comment};
 use crate::parse::review::parse_pr_review;
 use anyhow::{Context, Result};
@@ -260,6 +263,12 @@ impl GitHubPoller {
                 if let Err(err) = self.poll_repo(&full, &token).await {
                     warn!(repo = full, error = %err, "poll_repo failed");
                 }
+                if let Err(err) = self
+                    .scan_repo_coverage(&full, &repo.default_branch, &token)
+                    .await
+                {
+                    warn!(repo = full, error = %err, "scan_repo_coverage failed");
+                }
             }
         }
         Ok(())
@@ -397,6 +406,263 @@ impl GitHubPoller {
         if changed {
             info!(repo, "updated budget ledger from GitHub observations");
             self.db.save_budget_ledger(repo, &ledger, now).await?;
+        }
+        Ok(())
+    }
+
+    async fn get_json(&self, url: &str, token: &str) -> Result<Value> {
+        let val = self
+            .client
+            .get(url)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .header(USER_AGENT, "coderabbit-steward/0.1")
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(val)
+    }
+
+    async fn commit_has_coderabbit_review(&self, repo: &str, sha: &str, token: &str) -> bool {
+        let url = format!(
+            "{}/repos/{repo}/commits/{sha}/check-runs?per_page=50",
+            self.config.github_api_base
+        );
+        let Ok(val) = self.get_json(&url, token).await else {
+            return false;
+        };
+        let Ok(resp) = serde_json::from_value::<GhCheckRunsResp>(val) else {
+            return false;
+        };
+        resp.check_runs.iter().any(|cr| {
+            serde_json::to_string(cr)
+                .ok()
+                .and_then(|raw| parse_check_run(&raw))
+                .is_some_and(|o| matches!(o, CheckRunOutcome::Reviewed { .. }))
+        })
+    }
+
+    /// Walk new default-branch commits (capped at 20 per poll tick) and update `file_coverage`.
+    async fn scan_repo_coverage(&self, repo: &str, default_branch: &str, token: &str) -> Result<()> {
+        let cursor = self.db.get_scan_cursor(repo).await?;
+        let existing = self.db.list_file_coverage(repo).await?;
+        let mut map: HashMap<String, FileCoverageState> = existing
+            .into_iter()
+            .map(|f| (f.path.clone(), f))
+            .collect();
+
+        // First scan: seed default-branch tree + import closed `[review only]` baseline PRs.
+        if cursor.is_none() {
+            let tree_url = format!(
+                "{}/repos/{repo}/git/trees/{default_branch}?recursive=1",
+                self.config.github_api_base
+            );
+            if let Ok(tree_val) = self.get_json(&tree_url, token).await
+                && let Some(entries) = tree_val.get("tree").and_then(Value::as_array)
+            {
+                let now_str = Timestamp::now().to_string();
+                for entry in entries {
+                    if entry.get("type").and_then(Value::as_str) != Some("blob") {
+                        continue;
+                    }
+                    let Some(path) = entry.get("path").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let excluded = is_excluded_path(path);
+                    map.entry(path.to_string()).or_insert(FileCoverageState {
+                        path: path.to_string(),
+                        reviewed_blob: None,
+                        reviewed_commit: None,
+                        by: None,
+                        unreviewed_lines: if excluded { 0 } else { 1 },
+                        unreviewed_since: if excluded { None } else { Some(now_str.clone()) },
+                        excluded,
+                    });
+                }
+            }
+
+            // Import closed `[review only]` baseline PRs if CodeRabbit reviewed them.
+            let closed_url = format!(
+                "{}/repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=20",
+                self.config.github_api_base
+            );
+            if let Ok(Value::Array(prs)) = self.get_json(&closed_url, token).await {
+                for pr in prs {
+                    let title = pr.get("title").and_then(Value::as_str).unwrap_or("");
+                    if !title.starts_with("[review only]") {
+                        continue;
+                    }
+                    let Some(pr_num) = pr.get("number").and_then(Value::as_u64) else {
+                        continue;
+                    };
+                    let Some(head_sha) = pr
+                        .get("head")
+                        .and_then(|h| h.get("sha"))
+                        .and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    if !self.commit_has_coderabbit_review(repo, head_sha, token).await {
+                        continue;
+                    }
+                    let files_url = format!(
+                        "{}/repos/{repo}/pulls/{pr_num}/files?per_page=100",
+                        self.config.github_api_base
+                    );
+                    if let Ok(Value::Array(files)) = self.get_json(&files_url, token).await {
+                        let changes: Vec<CommitFileChange> = files
+                            .iter()
+                            .filter_map(|f| {
+                                let path = f.get("filename").and_then(Value::as_str)?.to_string();
+                                Some(CommitFileChange {
+                                    path,
+                                    blob_sha: f.get("sha").and_then(Value::as_str).map(ToString::to_string),
+                                    lines_changed: f
+                                        .get("changes")
+                                        .and_then(Value::as_u64)
+                                        .unwrap_or(0) as u32,
+                                    removed: f.get("status").and_then(Value::as_str) == Some("removed"),
+                                })
+                            })
+                            .collect();
+                        apply_commit_changes(
+                            &mut map,
+                            &changes,
+                            &CommitVerdict::Reviewed {
+                                by: "full".to_string(),
+                                commit_sha: head_sha.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        // Collect commits to process in chronological (oldest-first) order.
+        let commit_shas: Vec<String> = match cursor.as_deref() {
+            None => {
+                let commits_url = format!(
+                    "{}/repos/{repo}/commits?sha={default_branch}&per_page=20",
+                    self.config.github_api_base
+                );
+                let Some(Value::Array(arr)) = self.get_with_etag(&commits_url, token).await? else {
+                    return Ok(());
+                };
+                arr.into_iter()
+                    .rev()
+                    .filter_map(|c| c.get("sha").and_then(Value::as_str).map(ToString::to_string))
+                    .collect()
+            }
+            Some(base_sha) => {
+                let cmp_url = format!(
+                    "{}/repos/{repo}/compare/{base_sha}...{default_branch}",
+                    self.config.github_api_base
+                );
+                let Some(cmp_val) = self.get_with_etag(&cmp_url, token).await? else {
+                    return Ok(());
+                };
+                cmp_val
+                    .get("commits")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .take(20)
+                            .filter_map(|c| c.get("sha").and_then(Value::as_str).map(ToString::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+        };
+
+        if commit_shas.is_empty() && cursor.is_some() {
+            return Ok(());
+        }
+
+        let mut removed_paths: Vec<String> = Vec::new();
+        let mut last_sha: Option<String> = None;
+
+        for sha in &commit_shas {
+            let commit_url = format!("{}/repos/{repo}/commits/{sha}", self.config.github_api_base);
+            let Ok(commit_val) = self.get_json(&commit_url, token).await else {
+                break;
+            };
+            let commit_ts = commit_val
+                .get("commit")
+                .and_then(|c| c.get("committer"))
+                .and_then(|c| c.get("date"))
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse::<Timestamp>().ok())
+                .unwrap_or_else(Timestamp::now);
+
+            let changes: Vec<CommitFileChange> = commit_val
+                .get("files")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|f| {
+                            let path = f.get("filename").and_then(Value::as_str)?.to_string();
+                            let removed = f.get("status").and_then(Value::as_str) == Some("removed");
+                            if removed {
+                                removed_paths.push(path.clone());
+                            }
+                            let additions = f.get("additions").and_then(Value::as_u64).unwrap_or(0);
+                            let deletions = f.get("deletions").and_then(Value::as_u64).unwrap_or(0);
+                            Some(CommitFileChange {
+                                path,
+                                blob_sha: f.get("sha").and_then(Value::as_str).map(ToString::to_string),
+                                lines_changed: (additions + deletions) as u32,
+                                removed,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mut reviewed = false;
+            let pulls_url = format!(
+                "{}/repos/{repo}/commits/{sha}/pulls",
+                self.config.github_api_base
+            );
+            if let Ok(Value::Array(prs)) = self.get_json(&pulls_url, token).await {
+                for pr in prs {
+                    if let Some(head_sha) = pr
+                        .get("head")
+                        .and_then(|h| h.get("sha"))
+                        .and_then(Value::as_str)
+                        && self.commit_has_coderabbit_review(repo, head_sha, token).await
+                    {
+                        reviewed = true;
+                        break;
+                    }
+                }
+            }
+
+            let verdict = if reviewed {
+                CommitVerdict::Reviewed {
+                    by: "pr".to_string(),
+                    commit_sha: sha.clone(),
+                }
+            } else {
+                CommitVerdict::Unreviewed { at: commit_ts }
+            };
+
+            apply_commit_changes(&mut map, &changes, &verdict);
+            last_sha = Some(sha.clone());
+        }
+
+        for path in removed_paths {
+            if !map.contains_key(&path) {
+                self.db.delete_file_coverage(repo, &path).await?;
+            }
+        }
+        for state in map.values() {
+            self.db.upsert_file_coverage(repo, state).await?;
+        }
+        if let Some(sha) = last_sha {
+            self.db.set_scan_cursor(repo, &sha).await?;
+            info!(repo, scanned = commit_shas.len(), cursor = %sha, "updated coverage map");
         }
         Ok(())
     }
