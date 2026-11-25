@@ -1,6 +1,8 @@
 use crate::config::Config;
+use crate::coverage::CommitFileChange;
 use crate::findings::{ParsedFinding, parse_outside_diff_findings, parse_review_comment};
 use crate::parse::check_run::{CheckRunOutcome, parse_check_run};
+use crate::parse::is_coderabbit_login;
 use crate::synthetic::{ProactiveBatch, build_base_tree_entries};
 use anyhow::{Context, Result};
 use jiff::Timestamp;
@@ -222,7 +224,7 @@ impl GitHubActuator {
             .context("missing default branch tree sha")?
             .to_string();
 
-        // 2. Read current tree blobs and construct synthetic base tree.
+        // 2. Read current tree entries (blobs + submodules) and reject truncated responses.
         let tree_url = format!(
             "{}/repos/{repo}/git/trees/{head_tree_sha}?recursive=1",
             self.config.github_api_base
@@ -238,24 +240,33 @@ impl GitHubActuator {
             .error_for_status()?
             .json()
             .await?;
-        let head_blobs: Vec<(String, String, String)> = tree_val
+        if tree_val
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            anyhow::bail!("recursive tree truncated for {repo}; refusing to build partial synthetic base");
+        }
+        let head_entries: Vec<(String, String, String, String)> = tree_val
             .get("tree")
             .and_then(Value::as_array)
             .context("missing tree array")?
             .iter()
             .filter_map(|e| {
-                if e.get("type").and_then(Value::as_str) != Some("blob") {
+                let entry_type = e.get("type").and_then(Value::as_str)?;
+                if entry_type != "blob" && entry_type != "commit" {
                     return None;
                 }
                 Some((
                     e.get("path").and_then(Value::as_str)?.to_string(),
                     e.get("mode").and_then(Value::as_str)?.to_string(),
+                    entry_type.to_string(),
                     e.get("sha").and_then(Value::as_str)?.to_string(),
                 ))
             })
             .collect();
 
-        let base_entries = build_base_tree_entries(&head_blobs, &batch.files);
+        let base_entries = build_base_tree_entries(&head_entries, &batch.files);
         let create_tree_url = format!("{}/repos/{repo}/git/trees", self.config.github_api_base);
         let base_tree_resp: Value = self
             .client
@@ -320,7 +331,7 @@ impl GitHubActuator {
             .context("missing head commit sha")?
             .to_string();
 
-        // 4. Push refs/heads/review/<area>-<ts>/{base,all}.
+        // 4. Push refs/heads/review/<area>-<ts>/{base,all}, rolling back on partial failure.
         let safe_area: String = batch
             .area
             .chars()
@@ -330,8 +341,10 @@ impl GitHubActuator {
         let base_branch = format!("review/{safe_area}-{ts}/base");
         let head_branch = format!("review/{safe_area}-{ts}/all");
         let refs_url = format!("{}/repos/{repo}/git/refs", self.config.github_api_base);
+        let mut created_refs: Vec<String> = Vec::new();
         for (branch, sha) in [(&base_branch, &base_commit_sha), (&head_branch, &head_commit_sha)] {
-            self.client
+            let res = self
+                .client
                 .post(&refs_url)
                 .header(AUTHORIZATION, format!("Bearer {app_token}"))
                 .header(USER_AGENT, "coderabbit-steward/0.1")
@@ -341,13 +354,20 @@ impl GitHubActuator {
                     "sha": sha,
                 }))
                 .send()
-                .await?
-                .error_for_status()?;
+                .await
+                .and_then(|r| r.error_for_status());
+            match res {
+                Ok(_) => created_refs.push(branch.clone()),
+                Err(err) => {
+                    self.delete_refs_best_effort(repo, &app_token, &created_refs).await;
+                    return Err(err.into());
+                }
+            }
         }
 
-        // 5. Open draft PR and apply labels via user PAT so CodeRabbit reviews it.
+        // 5. Open draft PR and apply labels via user PAT, rolling back PR & refs on failure.
         let pr_url = format!("{}/repos/{repo}/pulls", self.config.github_api_base);
-        let pr_resp: Value = self
+        let pr_res = self
             .client
             .post(&pr_url)
             .header(AUTHORIZATION, format!("Bearer {user_token}"))
@@ -366,10 +386,15 @@ impl GitHubActuator {
                 ),
             }))
             .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+            .await
+            .and_then(|r| r.error_for_status());
+        let pr_resp: Value = match pr_res {
+            Ok(resp) => resp.json().await?,
+            Err(err) => {
+                self.delete_refs_best_effort(repo, &app_token, &created_refs).await;
+                return Err(err.into());
+            }
+        };
         let pr_number = pr_resp
             .get("number")
             .and_then(Value::as_u64)
@@ -379,15 +404,30 @@ impl GitHubActuator {
             "{}/repos/{repo}/issues/{pr_number}/labels",
             self.config.github_api_base
         );
-        self.client
+        let label_res = self
+            .client
             .post(&labels_url)
             .header(AUTHORIZATION, format!("Bearer {user_token}"))
             .header(USER_AGENT, "coderabbit-steward/0.1")
             .header("Accept", "application/vnd.github+json")
             .json(&serde_json::json!({ "labels": ["cr-review", "cr-proactive"] }))
             .send()
-            .await?
-            .error_for_status()?;
+            .await
+            .and_then(|r| r.error_for_status());
+        if let Err(err) = label_res {
+            let close_url = format!("{}/repos/{repo}/pulls/{pr_number}", self.config.github_api_base);
+            let _ = self
+                .client
+                .patch(&close_url)
+                .header(AUTHORIZATION, format!("Bearer {app_token}"))
+                .header(USER_AGENT, "coderabbit-steward/0.1")
+                .header("Accept", "application/vnd.github+json")
+                .json(&serde_json::json!({ "state": "closed" }))
+                .send()
+                .await;
+            self.delete_refs_best_effort(repo, &app_token, &created_refs).await;
+            return Err(err.into());
+        }
 
         Ok(OpenedProactivePr {
             pr_number,
@@ -395,6 +435,99 @@ impl GitHubActuator {
             base_branch,
             head_branch,
         })
+    }
+
+    async fn delete_refs_best_effort(&self, repo: &str, app_token: &str, branches: &[String]) {
+        for branch in branches {
+            let ref_url = format!(
+                "{}/repos/{repo}/git/refs/heads/{branch}",
+                self.config.github_api_base
+            );
+            let _ = self
+                .client
+                .delete(&ref_url)
+                .header(AUTHORIZATION, format!("Bearer {app_token}"))
+                .header(USER_AGENT, "coderabbit-steward/0.1")
+                .header("Accept", "application/vnd.github+json")
+                .send()
+                .await;
+        }
+    }
+
+    fn parse_next_link(headers: &reqwest::header::HeaderMap) -> Option<String> {
+        let link = headers.get("link")?.to_str().ok()?;
+        for part in link.split(',') {
+            let mut segs = part.trim().split(';');
+            let url_part = segs.next()?.trim();
+            let is_next = segs.any(|s| s.trim() == r#"rel="next""#);
+            if is_next && url_part.starts_with('<') && url_part.ends_with('>') {
+                return Some(url_part[1..url_part.len() - 1].to_string());
+            }
+        }
+        None
+    }
+
+    async fn get_paginated_array(&self, first_url: &str, token: &str) -> Result<Vec<Value>> {
+        let mut out = Vec::new();
+        let mut next = Some(first_url.to_string());
+        while let Some(url) = next {
+            let resp = self
+                .client
+                .get(&url)
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .header(USER_AGENT, "coderabbit-steward/0.1")
+                .header("Accept", "application/vnd.github+json")
+                .send()
+                .await?
+                .error_for_status()?;
+            next = Self::parse_next_link(resp.headers());
+            let page: Value = resp.json().await?;
+            if let Some(arr) = page.as_array() {
+                out.extend(arr.iter().cloned());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Return whether a PR is already closed on GitHub.
+    pub async fn is_pr_closed(&mut self, repo: &str, pr_number: u64) -> Result<bool> {
+        let token = self.read_token_for_repo(repo).await?;
+        let url = format!("{}/repos/{repo}/pulls/{pr_number}", self.config.github_api_base);
+        let resp: Value = self
+            .client
+            .get(&url)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .header(USER_AGENT, "coderabbit-steward/0.1")
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(resp.get("state").and_then(Value::as_str) == Some("closed"))
+    }
+
+    /// Fetch all files covered by a PR (paginated) so coverage can advance after proactive review.
+    pub async fn fetch_pr_files(&mut self, repo: &str, pr_number: u64) -> Result<Vec<CommitFileChange>> {
+        let token = self.read_token_for_repo(repo).await?;
+        let url = format!(
+            "{}/repos/{repo}/pulls/{pr_number}/files?per_page=100",
+            self.config.github_api_base
+        );
+        let raw = self.get_paginated_array(&url, &token).await?;
+        Ok(raw
+            .iter()
+            .filter_map(|f| {
+                let path = f.get("filename").and_then(Value::as_str)?.to_string();
+                let removed = f.get("status").and_then(Value::as_str) == Some("removed");
+                Some(CommitFileChange {
+                    path,
+                    blob_sha: f.get("sha").and_then(Value::as_str).map(ToString::to_string),
+                    lines_changed: f.get("changes").and_then(Value::as_u64).unwrap_or(0) as u32,
+                    removed,
+                })
+            })
+            .collect())
     }
 
     /// Check whether a PR's head commit has a finished CodeRabbit check run.
@@ -426,7 +559,7 @@ impl GitHubActuator {
         Ok(None)
     }
 
-    /// Collect inline review comments and outside-diff findings from a CodeRabbit-reviewed PR.
+    /// Collect all paginated inline review comments and CodeRabbit outside-diff findings from a PR.
     pub async fn fetch_pr_findings(&mut self, repo: &str, pr_number: u64) -> Result<Vec<ParsedFinding>> {
         let token = self.read_token_for_repo(repo).await?;
         let mut out = Vec::new();
@@ -435,17 +568,7 @@ impl GitHubActuator {
             "{}/repos/{repo}/pulls/{pr_number}/comments?per_page=100",
             self.config.github_api_base
         );
-        let comments: Vec<Value> = self
-            .client
-            .get(&comments_url)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .header(USER_AGENT, "coderabbit-steward/0.1")
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let comments = self.get_paginated_array(&comments_url, &token).await?;
         for c in &comments {
             if let Some(f) = parse_review_comment(c) {
                 out.push(f);
@@ -453,50 +576,34 @@ impl GitHubActuator {
         }
 
         let reviews_url = format!(
-            "{}/repos/{repo}/pulls/{pr_number}/reviews?per_page=50",
+            "{}/repos/{repo}/pulls/{pr_number}/reviews?per_page=100",
             self.config.github_api_base
         );
-        let reviews: Vec<Value> = self
-            .client
-            .get(&reviews_url)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .header(USER_AGENT, "coderabbit-steward/0.1")
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let reviews = self.get_paginated_array(&reviews_url, &token).await?;
         for r in &reviews {
-            if let Some(body) = r.get("body").and_then(Value::as_str) {
+            let is_cr = r
+                .get("user")
+                .and_then(|u| u.get("login"))
+                .and_then(Value::as_str)
+                .is_some_and(is_coderabbit_login);
+            if is_cr && let Some(body) = r.get("body").and_then(Value::as_str) {
                 out.extend(parse_outside_diff_findings(body));
             }
         }
         Ok(out)
     }
 
-    /// Close a proactive review PR and delete its temporary `review/**` branches via the GitHub App.
+    /// Close a proactive review PR and delete only the exact `review/**` branches created by this run.
     pub async fn close_proactive_pr_and_cleanup(
         &mut self,
         repo: &str,
         pr_number: u64,
         summary_comment: &str,
+        owned_branches: &[String],
     ) -> Result<()> {
         let token = self.installation_token_for_repo(repo).await?;
 
         let pr_url = format!("{}/repos/{repo}/pulls/{pr_number}", self.config.github_api_base);
-        let pr_val: Value = self
-            .client
-            .get(&pr_url)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .header(USER_AGENT, "coderabbit-steward/0.1")
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-
         let comment_url = format!(
             "{}/repos/{repo}/issues/{pr_number}/comments",
             self.config.github_api_base
@@ -521,27 +628,12 @@ impl GitHubActuator {
             .await?
             .error_for_status()?;
 
-        for field in ["head", "base"] {
-            if let Some(branch) = pr_val
-                .get(field)
-                .and_then(|o| o.get("ref"))
-                .and_then(Value::as_str)
-                && branch.starts_with("review/")
-            {
-                let ref_url = format!(
-                    "{}/repos/{repo}/git/refs/heads/{branch}",
-                    self.config.github_api_base
-                );
-                let _ = self
-                    .client
-                    .delete(&ref_url)
-                    .header(AUTHORIZATION, format!("Bearer {token}"))
-                    .header(USER_AGENT, "coderabbit-steward/0.1")
-                    .header("Accept", "application/vnd.github+json")
-                    .send()
-                    .await;
-            }
-        }
+        let safe_owned: Vec<String> = owned_branches
+            .iter()
+            .filter(|b| b.starts_with("review/"))
+            .cloned()
+            .collect();
+        self.delete_refs_best_effort(repo, &token, &safe_owned).await;
         Ok(())
     }
 

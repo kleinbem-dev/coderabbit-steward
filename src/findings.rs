@@ -48,24 +48,48 @@ pub fn compute_fingerprint(repo: &str, path: &str, title: &str, code_quote: &str
     hex::encode(hasher.finalize())
 }
 
+/// Extract a stable code quote from a GitHub diff hunk, excluding volatile `@@` hunk headers.
+fn stable_hunk_quote(diff_hunk: &str) -> String {
+    let code_lines: Vec<&str> = diff_hunk
+        .lines()
+        .filter(|l| !l.starts_with("@@"))
+        .map(|l| l.trim_start_matches(['+', '-', ' ']).trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let start = code_lines.len().saturating_sub(3);
+    code_lines[start..].join("\n")
+}
+
+/// Read severity from explicit CodeRabbit badge header lines rather than explanation prose.
 fn detect_severity_and_category(body: &str) -> (String, String) {
-    let lower = body.to_ascii_lowercase();
-    let severity = if lower.contains("critical") || lower.contains("🔴") {
+    let header: String = body
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim().starts_with("<!--"))
+        .take(3)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_lowercase();
+
+    let severity = if header.contains("**critical**") || header.contains("🔴") {
         "critical"
-    } else if lower.contains("major") || lower.contains("🟠") || lower.contains("potential issue") {
+    } else if header.contains("**major**")
+        || header.contains("🟠")
+        || header.contains("potential issue")
+    {
         "major"
-    } else if lower.contains("nitpick") || lower.contains("🧹") {
+    } else if header.contains("**nitpick**") || header.contains("🧹") {
         "nitpick"
     } else {
         "minor"
     };
-    let category = if lower.contains("security") {
+
+    let category = if header.contains("security") {
         "security"
-    } else if lower.contains("correctness") || lower.contains("potential issue") {
+    } else if header.contains("correctness") || header.contains("potential issue") {
         "correctness"
-    } else if lower.contains("performance") {
+    } else if header.contains("performance") {
         "performance"
-    } else if lower.contains("refactor") || lower.contains("maintainability") {
+    } else if header.contains("refactor") || header.contains("maintainability") {
         "maintainability"
     } else {
         "general"
@@ -117,11 +141,11 @@ pub fn parse_review_comment(comment: &Value) -> Option<ParsedFinding> {
         .get("line")
         .and_then(Value::as_i64)
         .or_else(|| comment.get("original_line").and_then(Value::as_i64));
-    let code_quote = comment
+    let raw_hunk = comment
         .get("diff_hunk")
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+        .unwrap_or("");
+    let code_quote = stable_hunk_quote(raw_hunk);
     let (severity, category) = detect_severity_and_category(body);
     let title = extract_title(body, &path);
 
@@ -151,6 +175,22 @@ pub fn parse_outside_diff_findings(review_body: &str) -> Vec<ParsedFinding> {
         }
         let (severity, category) = detect_severity_and_category(&body);
         let title = extract_title(&body, &path);
+        // Anchor outside-diff findings to a fenced code snippet if present, else line number,
+        // so two occurrences with the same title in one file remain distinct.
+        let code_quote = body
+            .split("```")
+            .nth(1)
+            .map(|blk| {
+                blk.lines()
+                    .skip(1)
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .filter(|q| !q.is_empty())
+            .unwrap_or_else(|| line.map(|l| format!("line:{l}")).unwrap_or_default());
         out.push(ParsedFinding {
             path,
             line,
@@ -158,7 +198,7 @@ pub fn parse_outside_diff_findings(review_body: &str) -> Vec<ParsedFinding> {
             category,
             title,
             body,
-            code_quote: String::new(),
+            code_quote,
         });
     }
     out

@@ -51,17 +51,19 @@ fn selects_highest_priority_area_and_builds_delta_base_tree() {
     assert_eq!(batch.area, "src");
     assert_eq!(batch.files.len(), 2);
 
-    let head_blobs = vec![
-        ("README.md".into(), "100644".into(), "blob_readme".into()),
-        ("src/auth.rs".into(), "100644".into(), "blob_auth_new".into()),
-        ("src/new_mod.rs".into(), "100644".into(), "blob_new_mod".into()),
-        ("docs/guide.md".into(), "100644".into(), "blob_guide".into()),
+    let head_entries = vec![
+        ("README.md".into(), "100644".into(), "blob".into(), "blob_readme".into()),
+        ("src/auth.rs".into(), "100644".into(), "blob".into(), "blob_auth_new".into()),
+        ("src/new_mod.rs".into(), "100644".into(), "blob".into(), "blob_new_mod".into()),
+        ("docs/guide.md".into(), "100644".into(), "blob".into(), "blob_guide".into()),
+        ("vendor/sub".into(), "160000".into(), "commit".into(), "sub_commit_sha".into()),
     ];
 
-    let base_tree = build_base_tree_entries(&head_blobs, &batch.files);
-    // Unchanged files stay at head blob for full context
+    let base_tree = build_base_tree_entries(&head_entries, &batch.files);
+    // Unchanged files and submodules stay at head entry for full context
     assert!(base_tree.iter().any(|e| e.path == "README.md" && e.sha == "blob_readme"));
     assert!(base_tree.iter().any(|e| e.path == "docs/guide.md" && e.sha == "blob_guide"));
+    assert!(base_tree.iter().any(|e| e.path == "vendor/sub" && e.entry_type == "commit" && e.sha == "sub_commit_sha"));
     // Previously reviewed batch file reverts to reviewed_blob (diff = only unreviewed delta)
     assert!(base_tree.iter().any(|e| e.path == "src/auth.rs" && e.sha == "blob_auth_old"));
     // Never-reviewed batch file is omitted from base tree (diff = whole file)

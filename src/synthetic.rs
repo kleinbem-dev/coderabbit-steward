@@ -80,12 +80,12 @@ pub fn select_proactive_batch(
     }
 }
 
-/// Build the synthetic base tree from the current default-branch blob entries:
-/// - Unchanged files keep their current blob (full repo context for CodeRabbit).
+/// Build the synthetic base tree from the current default-branch entries (`path, mode, type, sha`):
+/// - Unchanged blobs and submodule gitlinks (`commit`) keep their current entry.
 /// - Batch files with a `reviewed_blob` revert to that blob (diff = only unreviewed changes).
 /// - Never-reviewed batch files (`reviewed_blob == None`) are omitted (diff = whole file).
 pub fn build_base_tree_entries(
-    head_blobs: &[(String, String, String)],
+    head_entries: &[(String, String, String, String)],
     batch: &[FileCoverageState],
 ) -> Vec<GitTreeEntry> {
     let batch_map: HashMap<&str, Option<&str>> = batch
@@ -93,19 +93,28 @@ pub fn build_base_tree_entries(
         .map(|f| (f.path.as_str(), f.reviewed_blob.as_deref()))
         .collect();
 
-    let mut entries = Vec::with_capacity(head_blobs.len());
-    for (path, mode, sha) in head_blobs {
+    let mut entries = Vec::with_capacity(head_entries.len());
+    for (path, mode, entry_type, sha) in head_entries {
+        if entry_type != "blob" {
+            entries.push(GitTreeEntry {
+                path: path.clone(),
+                mode: mode.clone(),
+                entry_type: entry_type.clone(),
+                sha: sha.clone(),
+            });
+            continue;
+        }
         match batch_map.get(path.as_str()) {
             None => entries.push(GitTreeEntry {
                 path: path.clone(),
                 mode: mode.clone(),
-                entry_type: "blob".to_string(),
+                entry_type: entry_type.clone(),
                 sha: sha.clone(),
             }),
             Some(Some(reviewed_sha)) => entries.push(GitTreeEntry {
                 path: path.clone(),
                 mode: mode.clone(),
-                entry_type: "blob".to_string(),
+                entry_type: entry_type.clone(),
                 sha: (*reviewed_sha).to_string(),
             }),
             Some(None) => {

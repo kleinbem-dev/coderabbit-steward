@@ -5,6 +5,7 @@ use coderabbit_steward::actuator::ntfy::NtfyClient;
 use coderabbit_steward::api::{AppState, build_router};
 use coderabbit_steward::budget::BudgetSnapshot;
 use coderabbit_steward::config::{Config, Mode, resolve_web_dir};
+use coderabbit_steward::coverage::{CommitVerdict, apply_commit_changes};
 use coderabbit_steward::db::Db;
 use coderabbit_steward::findings::render_findings_issue_body;
 use coderabbit_steward::ingest::poll::GitHubPoller;
@@ -13,6 +14,7 @@ use coderabbit_steward::scheduler::{QueueCandidate, RepoScheduleInput, Scheduled
 use coderabbit_steward::synthetic::select_proactive_batch;
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -341,27 +343,77 @@ async fn run_scheduler_tick(
     for repo in repos {
         let full = format!("{}/{}", repo.owner, repo.name);
 
-        // Reconcile any open proactive synthetic PRs first (collect findings, close PR, delete branches).
+        // Reconcile any open proactive synthetic PRs first (collect findings, advance coverage, close PR).
         let open_proactive = db.list_open_proactive_runs(&full).await?;
+        let proactive_timeout_cutoff = now - SignedDuration::from_mins(60);
         for run in &open_proactive {
             let pr_u64 = u64::try_from(run.pr_number).unwrap_or(0);
             if pr_u64 == 0 {
                 continue;
             }
+            let owned_branches: Vec<String> = run
+                .outcome
+                .as_deref()
+                .and_then(|s| s.strip_prefix("branches:"))
+                .map(|s| s.split('|').map(ToString::to_string).collect())
+                .unwrap_or_default();
+
             match actuator.pr_coderabbit_outcome(&full, &run.head_sha).await {
                 Ok(Some(CheckRunOutcome::Reviewed { .. })) => {
-                    let parsed = actuator.fetch_pr_findings(&full, pr_u64).await.unwrap_or_default();
+                    let parsed = match actuator.fetch_pr_findings(&full, pr_u64).await {
+                        Ok(f) => f,
+                        Err(err) => {
+                            warn!(repo = %full, pr = pr_u64, error = %err, "failed to fetch proactive PR findings; will retry");
+                            continue;
+                        }
+                    };
                     let mut new_critical = 0usize;
+                    let mut upsert_failed = false;
                     for f in &parsed {
-                        if let Ok((_, is_new)) = db
+                        match db
                             .upsert_finding(&full, f, Some(&run.head_sha), Some(run.id))
                             .await
-                            && is_new
-                            && f.severity == "critical"
                         {
-                            new_critical += 1;
+                            Ok((_, is_new)) => {
+                                if is_new && f.severity == "critical" {
+                                    new_critical += 1;
+                                }
+                            }
+                            Err(err) => {
+                                warn!(repo = %full, pr = pr_u64, error = %err, "failed to upsert finding; keeping run open for retry");
+                                upsert_failed = true;
+                            }
                         }
                     }
+                    if upsert_failed {
+                        continue;
+                    }
+
+                    // Advance coverage for every file reviewed in this proactive batch before finishing.
+                    let reviewed_files = match actuator.fetch_pr_files(&full, pr_u64).await {
+                        Ok(files) => files,
+                        Err(err) => {
+                            warn!(repo = %full, pr = pr_u64, error = %err, "failed to fetch proactive PR files; will retry");
+                            continue;
+                        }
+                    };
+                    let mut cov_map: HashMap<_, _> = db
+                        .list_file_coverage(&full)
+                        .await?
+                        .into_iter()
+                        .map(|f| (f.path.clone(), f))
+                        .collect();
+                    apply_commit_changes(
+                        &mut cov_map,
+                        &reviewed_files,
+                        &CommitVerdict::Reviewed {
+                            by: "proactive".to_string(),
+                            commit_sha: run.head_sha.clone(),
+                        },
+                    );
+                    let upserts: Vec<_> = cov_map.into_values().collect();
+                    db.commit_coverage_batch(&full, &[], &upserts, None).await?;
+
                     if new_critical > 0
                         && let Some(client) = ntfy
                     {
@@ -388,7 +440,10 @@ async fn run_scheduler_tick(
                         "CodeRabbit finished reviewing this proactive batch ({} finding(s) recorded). Closing synthetic PR and cleaning up `review/**` branches.",
                         parsed.len()
                     );
-                    if let Err(err) = actuator.close_proactive_pr_and_cleanup(&full, pr_u64, &comment).await {
+                    if let Err(err) = actuator
+                        .close_proactive_pr_and_cleanup(&full, pr_u64, &comment, &owned_branches)
+                        .await
+                    {
                         warn!(repo = %full, pr = pr_u64, error = %err, "failed to close proactive PR");
                     }
                     db.finish_review_run(run.id, "reviewed").await?;
@@ -400,11 +455,33 @@ async fn run_scheduler_tick(
                             &full,
                             pr_u64,
                             "Rate-limited by CodeRabbit; closing synthetic PR without advancing coverage.",
+                            &owned_branches,
                         )
                         .await;
                     db.finish_review_run(run.id, "rate_limited").await?;
                 }
-                _ => {}
+                _ => {
+                    let closed = actuator.is_pr_closed(&full, pr_u64).await.unwrap_or(false);
+                    let timed_out = run
+                        .started_at
+                        .parse::<Timestamp>()
+                        .is_ok_and(|ts| ts < proactive_timeout_cutoff);
+                    if closed || timed_out {
+                        let outcome = if closed { "closed" } else { "timeout" };
+                        if !closed {
+                            let _ = actuator
+                                .close_proactive_pr_and_cleanup(
+                                    &full,
+                                    pr_u64,
+                                    "Proactive review timed out without a CodeRabbit outcome; closing synthetic PR.",
+                                    &owned_branches,
+                                )
+                                .await;
+                        }
+                        db.finish_review_run(run.id, outcome).await?;
+                        warn!(repo = %full, pr = pr_u64, outcome, "closed stale proactive review run");
+                    }
+                }
             }
         }
 
@@ -552,11 +629,14 @@ async fn run_scheduler_tick(
                         .await
                     {
                         Ok(opened) => {
+                            let branch_meta =
+                                format!("branches:{}|{}", opened.base_branch, opened.head_branch);
                             db.record_review_run(
                                 &full,
                                 i64::try_from(opened.pr_number).unwrap_or(0),
                                 &opened.head_sha,
                                 "proactive",
+                                Some(&branch_meta),
                             )
                             .await?;
                             proactive_today_fleet += 1;

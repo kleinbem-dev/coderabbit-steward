@@ -893,17 +893,19 @@ impl Db {
         pr_number: i64,
         head_sha: &str,
         kind: &str,
+        metadata: Option<&str>,
     ) -> Result<i64> {
         let now = now_rfc3339();
         let id = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO review_runs (repo, pr_number, head_sha, kind, started_at)
-             VALUES (?1, ?2, ?3, ?4, ?5) RETURNING id",
+            "INSERT INTO review_runs (repo, pr_number, head_sha, kind, started_at, outcome)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) RETURNING id",
         )
         .bind(repo)
         .bind(pr_number)
         .bind(head_sha)
         .bind(kind)
         .bind(&now)
+        .bind(metadata)
         .fetch_one(&self.pool)
         .await?;
         Ok(id)
