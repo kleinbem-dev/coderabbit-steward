@@ -364,6 +364,7 @@ async fn run_scheduler_tick(
     let now = Timestamp::now();
     let timeout_cutoff = now - SignedDuration::from_mins(15);
     let mut proactive_today_fleet = db.count_proactive_today(None, now).await?;
+    let mut open_proactive_fleet = db.count_open_proactive_runs_fleet().await?;
 
     for repo in repos {
         let full = format!("{}/{}", repo.owner, repo.name);
@@ -596,7 +597,7 @@ async fn run_scheduler_tick(
             repo_daily_cap: u32::try_from(settings.repo_daily_cap.max(0)).unwrap_or(6),
             proactive_today_fleet,
             fleet_daily_cap: u32::try_from(settings.fleet_daily_cap.max(0)).unwrap_or(40),
-            has_proactive_candidate: proactive_choice.is_some(),
+            has_proactive_candidate: open_proactive_fleet == 0 && proactive_choice.is_some(),
         };
 
         match decide(&input) {
@@ -699,6 +700,7 @@ async fn run_scheduler_tick(
                                 let _ = db.update_queue_state(qid, "done", None).await;
                             }
                             proactive_today_fleet += 1;
+                            open_proactive_fleet += 1;
                             info!(
                                 repo = %full,
                                 pr = opened.pr_number,

@@ -204,6 +204,7 @@ impl Db {
             for stmt in [
                 "DELETE FROM budget_state WHERE repo = ?1",
                 "DELETE FROM queue WHERE repo = ?1",
+                "DELETE FROM review_runs WHERE repo = ?1",
                 "DELETE FROM file_coverage WHERE repo = ?1",
                 "DELETE FROM scan_cursor WHERE repo = ?1",
                 "DELETE FROM findings WHERE repo = ?1",
@@ -1058,6 +1059,15 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    pub async fn count_open_proactive_runs_fleet(&self) -> Result<u32> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM review_runs WHERE kind = 'proactive' AND finished_at IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(u32::try_from(count.max(0)).unwrap_or(0))
     }
 
     pub async fn count_proactive_today(&self, repo: Option<&str>, now: Timestamp) -> Result<u32> {
