@@ -1,9 +1,11 @@
 use crate::actuator::ntfy::NtfyClient;
+use crate::actuator::revue::RevueClient;
 use crate::budget::BudgetSnapshot;
 use crate::config::Mode;
 use crate::coverage::{self, CoverageSummary};
 use crate::db::{Db, FindingRow, QueueRow, SpendRow};
 use crate::ingest::webhook::{handle_webhook_event, verify_signature};
+use crate::synthetic::split_full_repo_batches;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -25,6 +27,7 @@ pub struct AppState {
     pub trust_authentik_header: bool,
     pub webhook_secret: Option<String>,
     pub ntfy: Option<NtfyClient>,
+    pub revue: Option<RevueClient>,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +87,18 @@ pub struct PatchSettingsRequest {
     pub mode: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RevueCoverageFile {
+    pub path: String,
+    pub blob_sha: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RevueCoverageReport {
+    pub commit_sha: String,
+    pub paths: Vec<RevueCoverageFile>,
+}
+
 pub fn build_router(state: AppState, web_dir: Option<PathBuf>) -> Router {
     let protected = Router::new()
         .route("/api/v1/budget", get(get_fleet_budget))
@@ -92,6 +107,10 @@ pub fn build_router(state: AppState, web_dir: Option<PathBuf>) -> Router {
         .route("/api/v1/reviews", post(post_review_request))
         .route("/api/v1/queue", get(get_queue))
         .route("/api/v1/coverage/{owner}/{repo}", get(get_coverage))
+        .route(
+            "/api/v1/coverage/{owner}/{repo}/revue",
+            post(post_revue_coverage),
+        )
         .route("/api/v1/findings", get(get_findings))
         .route("/api/v1/findings/{id}", patch(patch_finding))
         .route("/api/v1/settings", get(get_settings).patch(patch_settings))
@@ -186,8 +205,14 @@ async fn post_webhook(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown");
 
-    let outcome = handle_webhook_event(&state.db, state.ntfy.as_ref(), event, &body)
-        .await
+    let outcome = handle_webhook_event(
+        &state.db,
+        state.ntfy.as_ref(),
+        state.revue.as_ref(),
+        event,
+        &body,
+    )
+    .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -366,9 +391,47 @@ async fn post_review_request(
     State(state): State<AppState>,
     Json(req): Json<CreateReviewRequest>,
 ) -> Result<(StatusCode, Json<QueueRow>), (StatusCode, String)> {
-    let (kind, paths_json) = if req.full.unwrap_or(false) {
-        ("full", None)
-    } else if let Some(paths) = req.paths {
+    if req.full.unwrap_or(false) {
+        let cov_files = state
+            .db
+            .list_file_coverage(&req.repo)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let file_cap = state
+            .db
+            .list_repos()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .into_iter()
+            .find(|r| format!("{}/{}", r.owner, r.name) == req.repo)
+            .map(|r| usize::try_from(r.file_cap.max(1)).unwrap_or(50))
+            .unwrap_or(50);
+
+        let batches = split_full_repo_batches(&cov_files, file_cap);
+        if batches.is_empty() {
+            let row = state
+                .db
+                .enqueue_review(&req.repo, "full", None, None)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            return Ok((StatusCode::CREATED, Json(row)));
+        }
+        let batches_json: Vec<String> = batches
+            .into_iter()
+            .map(|b| {
+                let paths: Vec<String> = b.files.into_iter().map(|f| f.path).collect();
+                serde_json::to_string(&paths).unwrap_or_default()
+            })
+            .collect();
+        let row = state
+            .db
+            .enqueue_review_batches(&req.repo, "full", &batches_json)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        return Ok((StatusCode::CREATED, Json(row)));
+    }
+
+    let (kind, paths_json) = if let Some(paths) = req.paths {
         ("proactive", Some(serde_json::to_string(&paths).unwrap_or_default()))
     } else {
         ("on-demand", None)
@@ -404,6 +467,25 @@ async fn get_coverage(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(coverage::summarize(&full, &files, Timestamp::now())))
+}
+
+async fn post_revue_coverage(
+    State(state): State<AppState>,
+    Path((owner, repo)): Path<(String, String)>,
+    Json(report): Json<RevueCoverageReport>,
+) -> Result<Json<CoverageSummary>, (StatusCode, String)> {
+    let full = format!("{owner}/{repo}");
+    let reported: Vec<(String, Option<String>)> = report
+        .paths
+        .into_iter()
+        .map(|p| (p.path, p.blob_sha))
+        .collect();
+    let updated = state
+        .db
+        .apply_revue_coverage(&full, &report.commit_sha, &reported)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(coverage::summarize(&full, &updated, Timestamp::now())))
 }
 
 async fn get_findings(

@@ -5,24 +5,102 @@
 
 	let detail = $state<RepoDetail | null>(null);
 	let error = $state<string | null>(null);
+	let prInput = $state('');
+	let prBusy = $state(false);
+	let fullBusy = $state(false);
+	let actionMsg = $state<string | null>(null);
 
 	const owner = $derived(page.params.owner);
 	const name = $derived(page.params.name);
 
-	onMount(async () => {
+	async function load() {
 		try {
 			detail = await apiFetch<RepoDetail>(`/api/v1/repo/${owner}/${name}`);
+			error = null;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		}
-	});
+	}
+
+	async function queuePr() {
+		if (prBusy) return;
+		const pr = Number(prInput.trim());
+		if (!Number.isSafeInteger(pr) || pr <= 0) return;
+		prBusy = true;
+		actionMsg = null;
+		try {
+			await apiFetch('/api/v1/reviews', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ repo: `${owner}/${name}`, pr })
+			});
+			prInput = '';
+			actionMsg = `Queued PR #${pr} for review (costs 1 slot when free).`;
+			await load();
+		} catch (e) {
+			actionMsg = e instanceof Error ? e.message : String(e);
+		} finally {
+			prBusy = false;
+		}
+	}
+
+	async function queueFullRepo() {
+		if (fullBusy) return;
+		fullBusy = true;
+		actionMsg = null;
+		try {
+			await apiFetch('/api/v1/reviews', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ repo: `${owner}/${name}`, full: true })
+			});
+			actionMsg = 'Queued full-repo review batches (spread over hours under daily caps).';
+			await load();
+		} catch (e) {
+			actionMsg = e instanceof Error ? e.message : String(e);
+		} finally {
+			fullBusy = false;
+		}
+	}
+
+	onMount(load);
 </script>
 
 <div class="space-y-6">
-	<div>
-		<a href="/" class="text-sm text-[var(--fg-muted)] hover:underline">← Fleet</a>
-		<h1 class="text-xl font-semibold mt-1">{owner}/{name}</h1>
+	<div class="flex flex-wrap items-end justify-between gap-4">
+		<div>
+			<a href="/" class="text-sm text-[var(--fg-muted)] hover:underline">← Fleet</a>
+			<h1 class="text-xl font-semibold mt-1">{owner}/{name}</h1>
+		</div>
+		<div class="flex flex-wrap items-center gap-2 text-sm">
+			<input
+				type="number"
+				min="1"
+				step="1"
+				placeholder="PR #"
+				bind:value={prInput}
+				class="w-24 px-2 py-1 rounded border border-[var(--border)] bg-transparent"
+			/>
+			<button
+				class="px-3 py-1 rounded border border-[var(--border)] hover:bg-[var(--bg-subtle)] disabled:opacity-50"
+				disabled={prBusy}
+				onclick={queuePr}
+			>
+				Queue PR
+			</button>
+			<button
+				class="px-3 py-1 rounded border border-[var(--border)] hover:bg-[var(--bg-subtle)] disabled:opacity-50"
+				disabled={fullBusy}
+				onclick={queueFullRepo}
+			>
+				Full Repo Review
+			</button>
+		</div>
 	</div>
+
+	{#if actionMsg}
+		<p class="text-sm text-emerald-500">{actionMsg}</p>
+	{/if}
 
 	{#if error}
 		<p class="text-sm text-red-500">{error}</p>

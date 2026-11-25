@@ -22,6 +22,7 @@ async fn health_budget_queue_and_auth() {
             trust_authentik_header: false,
             webhook_secret: None,
             ntfy: None,
+            revue: None,
         },
         None,
     );
@@ -101,6 +102,7 @@ async fn health_budget_queue_and_auth() {
             trust_authentik_header: false,
             webhook_secret: None,
             ntfy: None,
+            revue: None,
         },
         None,
     )
@@ -122,6 +124,7 @@ async fn health_budget_queue_and_auth() {
             trust_authentik_header: true,
             webhook_secret: None,
             ntfy: None,
+            revue: None,
         },
         None,
     )

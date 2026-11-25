@@ -1,4 +1,5 @@
 use crate::actuator::ntfy::NtfyClient;
+use crate::actuator::revue::RevueClient;
 use crate::db::Db;
 use crate::parse::check_run::{CheckRunOutcome, parse_check_run};
 use crate::parse::comment::{BotMessage, parse_issue_comment};
@@ -40,6 +41,7 @@ pub fn verify_signature(secret: &str, signature_header: &str, body: &[u8]) -> bo
 pub async fn handle_webhook_event(
     db: &Db,
     ntfy: Option<&NtfyClient>,
+    revue: Option<&RevueClient>,
     event: &str,
     payload: &[u8],
 ) -> Result<WebhookOutcome> {
@@ -66,7 +68,7 @@ pub async fn handle_webhook_event(
         "check_run" => handle_check_run(db, ntfy, repo, &root).await,
         "issue_comment" => handle_issue_comment(db, ntfy, repo, &root).await,
         "pull_request_review" => handle_pr_review(db, ntfy, repo, &root).await,
-        "pull_request" => handle_pull_request(db, repo, &root).await,
+        "pull_request" => handle_pull_request(db, revue, repo, &root).await,
         other => Ok(WebhookOutcome {
             ignored: true,
             message: format!("unhandled event: {other}"),
@@ -351,6 +353,7 @@ async fn handle_pr_review(
 
 async fn handle_pull_request(
     db: &Db,
+    revue: Option<&RevueClient>,
     repo: &str,
     root: &Value,
 ) -> Result<WebhookOutcome> {
@@ -379,6 +382,11 @@ async fn handle_pull_request(
     let updated = db.complete_queue_for_pr(repo, pr_number, target_state).await?;
     if updated > 0 {
         info!(repo, pr_number, target_state, "updated queued PR on close");
+        if merged
+            && let (Some(revue_client), Ok(pr_u64)) = (revue, u64::try_from(pr_number))
+        {
+            revue_client.trigger_advisory_review(repo, pr_u64, "merged-unreviewed");
+        }
     }
 
     Ok(WebhookOutcome {

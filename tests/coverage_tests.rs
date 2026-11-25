@@ -175,6 +175,7 @@ async fn coverage_api_and_fleet_budget_report_real_percentage() {
             trust_authentik_header: false,
             webhook_secret: None,
             ntfy: None,
+            revue: None,
         },
         None,
     );
