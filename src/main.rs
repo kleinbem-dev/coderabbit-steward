@@ -6,8 +6,11 @@ use coderabbit_steward::api::{AppState, build_router};
 use coderabbit_steward::budget::BudgetSnapshot;
 use coderabbit_steward::config::{Config, Mode, resolve_web_dir};
 use coderabbit_steward::db::Db;
+use coderabbit_steward::findings::render_findings_issue_body;
 use coderabbit_steward::ingest::poll::GitHubPoller;
+use coderabbit_steward::parse::check_run::CheckRunOutcome;
 use coderabbit_steward::scheduler::{QueueCandidate, RepoScheduleInput, ScheduledAction, decide};
+use coderabbit_steward::synthetic::select_proactive_batch;
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
 use std::path::PathBuf;
@@ -333,15 +336,84 @@ async fn run_scheduler_tick(
     let repos = db.list_repos().await?;
     let now = Timestamp::now();
     let timeout_cutoff = now - SignedDuration::from_mins(15);
+    let mut proactive_today_fleet = db.count_proactive_today(None, now).await?;
 
     for repo in repos {
         let full = format!("{}/{}", repo.owner, repo.name);
+
+        // Reconcile any open proactive synthetic PRs first (collect findings, close PR, delete branches).
+        let open_proactive = db.list_open_proactive_runs(&full).await?;
+        for run in &open_proactive {
+            let pr_u64 = u64::try_from(run.pr_number).unwrap_or(0);
+            if pr_u64 == 0 {
+                continue;
+            }
+            match actuator.pr_coderabbit_outcome(&full, &run.head_sha).await {
+                Ok(Some(CheckRunOutcome::Reviewed { .. })) => {
+                    let parsed = actuator.fetch_pr_findings(&full, pr_u64).await.unwrap_or_default();
+                    let mut new_critical = 0usize;
+                    for f in &parsed {
+                        if let Ok((_, is_new)) = db
+                            .upsert_finding(&full, f, Some(&run.head_sha), Some(run.id))
+                            .await
+                            && is_new
+                            && f.severity == "critical"
+                        {
+                            new_critical += 1;
+                        }
+                    }
+                    if new_critical > 0
+                        && let Some(client) = ntfy
+                    {
+                        client.send(
+                            &format!("cr-steward: {new_critical} CRITICAL finding(s) in {full}"),
+                            &format!("Proactive review PR #{pr_u64} found {new_critical} new critical finding(s)."),
+                            "urgent",
+                        );
+                    }
+                    let all_findings = db.list_findings(Some(&full), None).await.unwrap_or_default();
+                    let open_findings: Vec<_> = all_findings
+                        .into_iter()
+                        .filter(|f| matches!(f.status.as_str(), "new" | "real" | "needs-martin"))
+                        .collect();
+                    let issue_body = render_findings_issue_body(&full, &open_findings);
+                    let existing_issue = db.get_findings_issue_number(&full).await.unwrap_or(None);
+                    if let Ok(Some(num)) = actuator
+                        .sync_findings_issue(&full, existing_issue, &issue_body, !open_findings.is_empty())
+                        .await
+                    {
+                        let _ = db.set_findings_issue_number(&full, num).await;
+                    }
+                    let comment = format!(
+                        "CodeRabbit finished reviewing this proactive batch ({} finding(s) recorded). Closing synthetic PR and cleaning up `review/**` branches.",
+                        parsed.len()
+                    );
+                    if let Err(err) = actuator.close_proactive_pr_and_cleanup(&full, pr_u64, &comment).await {
+                        warn!(repo = %full, pr = pr_u64, error = %err, "failed to close proactive PR");
+                    }
+                    db.finish_review_run(run.id, "reviewed").await?;
+                    info!(repo = %full, pr = pr_u64, findings = parsed.len(), "completed proactive review run");
+                }
+                Ok(Some(CheckRunOutcome::RateLimited { .. })) => {
+                    let _ = actuator
+                        .close_proactive_pr_and_cleanup(
+                            &full,
+                            pr_u64,
+                            "Rate-limited by CodeRabbit; closing synthetic PR without advancing coverage.",
+                        )
+                        .await;
+                    db.finish_review_run(run.id, "rate_limited").await?;
+                }
+                _ => {}
+            }
+        }
+
         let ledger = db.load_budget_ledger(&full).await?;
         let snap = ledger.snapshot(now);
         let active = db.list_active_queue(&full).await?;
 
         let triggered = active.iter().find(|q| q.state == "triggered");
-        let has_pending_trigger = triggered.is_some();
+        let has_pending_trigger = triggered.is_some() || !db.list_open_proactive_runs(&full).await?.is_empty();
         let pending_timed_out = triggered.is_some_and(|q| {
             q.updated_at
                 .parse::<Timestamp>()
@@ -366,6 +438,16 @@ async fn run_scheduler_tick(
             })
             .collect();
 
+        let cov_files = db.list_file_coverage(&full).await?;
+        let proactive_batch = select_proactive_batch(
+            &cov_files,
+            now,
+            usize::try_from(repo.file_cap.max(1)).unwrap_or(50),
+            2000,
+        );
+        let quiet_for_minutes = db.quiet_minutes_for_repo(&full, now).await?;
+        let proactive_today_repo = db.count_proactive_today(Some(&full), now).await?;
+
         let input = RepoScheduleInput {
             repo: full.clone(),
             mode,
@@ -373,15 +455,15 @@ async fn run_scheduler_tick(
             has_pending_trigger,
             pending_timed_out,
             on_demand_queue,
-            quiet_for_minutes: 0,
-            required_quiet_minutes: u32::try_from(settings.quiet_minutes.max(0)).unwrap_or(30),
+            quiet_for_minutes,
+            required_quiet_minutes: u32::try_from(settings.quiet_minutes.max(0)).unwrap_or(45),
             predicted_demand: 0.0,
             open_unlabelled_risky_pr: false,
-            proactive_today_repo: 0,
-            repo_daily_cap: u32::try_from(settings.repo_daily_cap.max(0)).unwrap_or(1),
-            proactive_today_fleet: 0,
-            fleet_daily_cap: u32::try_from(settings.fleet_daily_cap.max(0)).unwrap_or(4),
-            has_proactive_candidate: false,
+            proactive_today_repo,
+            repo_daily_cap: u32::try_from(settings.repo_daily_cap.max(0)).unwrap_or(6),
+            proactive_today_fleet,
+            fleet_daily_cap: u32::try_from(settings.fleet_daily_cap.max(0)).unwrap_or(40),
+            has_proactive_candidate: proactive_batch.is_some(),
         };
 
         match decide(&input) {
@@ -457,7 +539,47 @@ async fn run_scheduler_tick(
                 debug!(repo = %full, %reason, "scheduler idle");
             }
             ScheduledAction::TriggerProactive => {
-                debug!(repo = %full, "proactive trigger deferred to Phase 3");
+                if let Some(batch) = proactive_batch {
+                    info!(
+                        repo = %full,
+                        area = %batch.area,
+                        files = batch.files.len(),
+                        lines = batch.total_lines,
+                        "opening proactive synthetic review PR"
+                    );
+                    match actuator
+                        .open_proactive_pr(&full, &repo.default_branch, &batch)
+                        .await
+                    {
+                        Ok(opened) => {
+                            db.record_review_run(
+                                &full,
+                                i64::try_from(opened.pr_number).unwrap_or(0),
+                                &opened.head_sha,
+                                "proactive",
+                            )
+                            .await?;
+                            proactive_today_fleet += 1;
+                            info!(
+                                repo = %full,
+                                pr = opened.pr_number,
+                                base = %opened.base_branch,
+                                head = %opened.head_branch,
+                                "proactive synthetic PR opened"
+                            );
+                        }
+                        Err(err) => {
+                            error!(repo = %full, area = %batch.area, error = %err, "failed to open proactive PR");
+                            if let Some(client) = ntfy {
+                                client.send(
+                                    &format!("cr-steward: proactive PR failed in {full}"),
+                                    &format!("Area {}: {err:#}", batch.area),
+                                    "default",
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
