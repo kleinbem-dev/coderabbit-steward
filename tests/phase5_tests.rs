@@ -138,10 +138,29 @@ async fn full_review_enqueues_batches_and_revue_endpoint_updates_coverage() {
     assert_eq!(src_a.by.as_deref(), Some("revue"));
     assert_eq!(src_a.unreviewed_lines, 0);
 
-    // 3. Removing an excluded repo (e.g. fork/archived) purges its queue and coverage
+    // 3. Removing an excluded repo (e.g. fork/archived) purges its queue, coverage, and ETags
+    db.set_etag("https://api.github.com/repos/kleinbem/demo/commits", "\"e1\"")
+        .await
+        .unwrap();
+    db.set_etag("https://api.github.com/repos/kleinbem/other/commits", "\"e2\"")
+        .await
+        .unwrap();
     assert!(db.delete_repo("kleinbem", "demo").await.unwrap());
     assert!(!db.delete_repo("kleinbem", "demo").await.unwrap());
     assert!(db.list_repos().await.unwrap().is_empty());
     assert!(db.list_queue(Some("kleinbem/demo")).await.unwrap().is_empty());
     assert!(db.list_file_coverage("kleinbem/demo").await.unwrap().is_empty());
+    assert!(
+        db.get_etag("https://api.github.com/repos/kleinbem/demo/commits")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        db.get_etag("https://api.github.com/repos/kleinbem/other/commits")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("\"e2\"")
+    );
 }

@@ -212,6 +212,19 @@ impl Db {
             ] {
                 sqlx::query(stmt).bind(&full_name).execute(&mut *tx).await?;
             }
+            let escaped = full_name
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            let etag_prefix = format!("%/repos/{escaped}/%");
+            let etag_exact = format!("%/repos/{escaped}");
+            sqlx::query(
+                "DELETE FROM poll_etags WHERE url LIKE ?1 ESCAPE '\\' OR url LIKE ?2 ESCAPE '\\'",
+            )
+            .bind(&etag_prefix)
+            .bind(&etag_exact)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(removed)
