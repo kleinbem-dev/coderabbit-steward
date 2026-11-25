@@ -37,6 +37,7 @@ async fn webhook_fails_closed_without_secret_and_rejects_bad_sig() {
             trust_authentik_header: false,
             webhook_secret: None,
             ntfy: None,
+            revue: None,
         },
         None,
     );
@@ -59,6 +60,7 @@ async fn webhook_fails_closed_without_secret_and_rejects_bad_sig() {
             trust_authentik_header: false,
             webhook_secret: Some("whsec".to_string()),
             ntfy: None,
+            revue: None,
         },
         None,
     );
@@ -92,6 +94,7 @@ async fn webhook_enqueues_rate_limited_pr_and_completes_on_review_or_merge() {
             trust_authentik_header: false,
             webhook_secret: Some(secret.to_string()),
             ntfy: None,
+            revue: None,
         },
         None,
     );
@@ -221,6 +224,7 @@ async fn webhook_ignores_rerequested_and_requeues_rate_limited_triggered_pr() {
             trust_authentik_header: false,
             webhook_secret: Some(secret.to_string()),
             ntfy: None,
+            revue: None,
         },
         None,
     );

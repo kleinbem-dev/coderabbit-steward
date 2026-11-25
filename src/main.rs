@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use coderabbit_steward::actuator::github::GitHubActuator;
 use coderabbit_steward::actuator::ntfy::NtfyClient;
+use coderabbit_steward::actuator::revue::RevueClient;
 use coderabbit_steward::api::{AppState, build_router};
 use coderabbit_steward::budget::BudgetSnapshot;
 use coderabbit_steward::config::{Config, Mode, resolve_web_dir};
@@ -11,10 +12,10 @@ use coderabbit_steward::findings::render_findings_issue_body;
 use coderabbit_steward::ingest::poll::GitHubPoller;
 use coderabbit_steward::parse::check_run::CheckRunOutcome;
 use coderabbit_steward::scheduler::{QueueCandidate, RepoScheduleInput, ScheduledAction, decide};
-use coderabbit_steward::synthetic::select_proactive_batch;
+use coderabbit_steward::synthetic::{batch_from_paths, select_proactive_batch};
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -65,6 +66,10 @@ struct DaemonArgs {
     ntfy_url: Option<String>,
     #[arg(long, env = "CR_STEWARD_NTFY_TOKEN")]
     ntfy_token: Option<String>,
+    #[arg(long, env = "CR_STEWARD_REVUE_URL")]
+    revue_url: Option<String>,
+    #[arg(long, env = "CR_STEWARD_REVUE_TOKEN")]
+    revue_token: Option<String>,
     #[arg(long, env = "CR_STEWARD_TRUST_AUTHENTIK_HEADER", default_value_t = false)]
     trust_authentik_header: bool,
 }
@@ -144,6 +149,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 github_webhook_secret,
                 ntfy_url,
                 ntfy_token,
+                revue_url,
+                revue_token,
                 trust_authentik_header,
             } = *args;
             let parsed_mode = Mode::parse(&mode)?;
@@ -163,6 +170,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 api_token: cli.api_token.clone(),
                 ntfy_url: ntfy_url.clone(),
                 ntfy_token: ntfy_token.clone(),
+                revue_url: revue_url.clone(),
+                revue_token: revue_token.clone(),
                 ..Config::default()
             };
 
@@ -173,12 +182,17 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 .filter(|u| !u.trim().is_empty())
                 .map(|url| NtfyClient::new(url, ntfy_token))
                 .transpose()?;
+            let revue = revue_url
+                .filter(|u| !u.trim().is_empty())
+                .map(|url| RevueClient::new(url, revue_token))
+                .transpose()?;
             info!(
                 listen = %config.listen,
                 mode = %config.mode.as_str(),
                 web_dir = ?resolved_web,
                 webhook_enabled = github_webhook_secret.as_deref().is_some_and(|s| !s.is_empty()),
                 ntfy_enabled = ntfy.is_some(),
+                revue_enabled = revue.is_some(),
                 "starting cr-steward daemon"
             );
 
@@ -196,12 +210,20 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let mut actuator = GitHubActuator::new(config.clone())?;
             let sched_db = db.clone();
             let sched_ntfy = ntfy.clone();
+            let sched_revue = revue.clone();
             tokio::spawn(async move {
                 let tick = Duration::from_secs(60);
+                let mut revue_offered: HashSet<i64> = HashSet::new();
                 loop {
                     tokio::time::sleep(tick).await;
-                    if let Err(err) =
-                        run_scheduler_tick(&sched_db, &mut actuator, sched_ntfy.as_ref()).await
+                    if let Err(err) = run_scheduler_tick(
+                        &sched_db,
+                        &mut actuator,
+                        sched_ntfy.as_ref(),
+                        sched_revue.as_ref(),
+                        &mut revue_offered,
+                    )
+                    .await
                     {
                         error!(error = %err, "scheduler tick error");
                     }
@@ -214,6 +236,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 trust_authentik_header,
                 webhook_secret: github_webhook_secret,
                 ntfy,
+                revue,
             };
             let router = build_router(state, resolved_web);
             let listener = tokio::net::TcpListener::bind(&listen)
@@ -332,6 +355,8 @@ async fn run_scheduler_tick(
     db: &Db,
     actuator: &mut GitHubActuator,
     ntfy: Option<&NtfyClient>,
+    revue: Option<&RevueClient>,
+    revue_offered: &mut HashSet<i64>,
 ) -> Result<()> {
     let settings = db.get_settings().await?;
     let mode = Mode::parse(&settings.mode).unwrap_or(Mode::Observe);
@@ -515,13 +540,42 @@ async fn run_scheduler_tick(
             })
             .collect();
 
+        let revue_wait_cutoff = now - SignedDuration::from_mins(90);
+        if let Some(revue_client) = revue {
+            for q in &active {
+                if q.state == "waiting"
+                    && q.kind == "on-demand"
+                    && let Some(pr) = q.pr_number.and_then(|n| u64::try_from(n).ok())
+                    && q.created_at
+                        .parse::<Timestamp>()
+                        .is_ok_and(|ts| ts < revue_wait_cutoff)
+                    && revue_offered.insert(q.id)
+                {
+                    revue_client.trigger_advisory_review(&full, pr, "queue-wait-90m");
+                }
+            }
+        }
+
         let cov_files = db.list_file_coverage(&full).await?;
-        let proactive_batch = select_proactive_batch(
-            &cov_files,
-            now,
-            usize::try_from(repo.file_cap.max(1)).unwrap_or(50),
-            2000,
-        );
+        let queued_batch_row = active
+            .iter()
+            .find(|q| q.state == "waiting" && (q.kind == "full" || q.kind == "proactive"));
+        let queued_batch = queued_batch_row.and_then(|q| {
+            let paths: Vec<String> = q
+                .paths_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            batch_from_paths(&paths, &cov_files, q.kind == "full")
+        });
+        let proactive_batch = queued_batch.or_else(|| {
+            select_proactive_batch(
+                &cov_files,
+                now,
+                usize::try_from(repo.file_cap.max(1)).unwrap_or(50),
+                2000,
+            )
+        });
         let quiet_for_minutes = db.quiet_minutes_for_repo(&full, now).await?;
         let proactive_today_repo = db.count_proactive_today(Some(&full), now).await?;
 
@@ -639,6 +693,9 @@ async fn run_scheduler_tick(
                                 Some(&branch_meta),
                             )
                             .await?;
+                            if let Some(q) = queued_batch_row {
+                                let _ = db.update_queue_state(q.id, "done", None).await;
+                            }
                             proactive_today_fleet += 1;
                             info!(
                                 repo = %full,

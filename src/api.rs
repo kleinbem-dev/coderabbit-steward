@@ -1,9 +1,11 @@
 use crate::actuator::ntfy::NtfyClient;
+use crate::actuator::revue::RevueClient;
 use crate::budget::BudgetSnapshot;
 use crate::config::Mode;
-use crate::coverage::{self, CoverageSummary};
+use crate::coverage::{self, CommitFileChange, CommitVerdict, CoverageSummary, apply_commit_changes};
 use crate::db::{Db, FindingRow, QueueRow, SpendRow};
 use crate::ingest::webhook::{handle_webhook_event, verify_signature};
+use crate::synthetic::split_full_repo_batches;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -13,6 +15,7 @@ use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use subtle::ConstantTimeEq;
 use tower_http::cors::CorsLayer;
@@ -25,6 +28,7 @@ pub struct AppState {
     pub trust_authentik_header: bool,
     pub webhook_secret: Option<String>,
     pub ntfy: Option<NtfyClient>,
+    pub revue: Option<RevueClient>,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +88,18 @@ pub struct PatchSettingsRequest {
     pub mode: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RevueCoverageFile {
+    pub path: String,
+    pub blob_sha: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RevueCoverageReport {
+    pub commit_sha: String,
+    pub paths: Vec<RevueCoverageFile>,
+}
+
 pub fn build_router(state: AppState, web_dir: Option<PathBuf>) -> Router {
     let protected = Router::new()
         .route("/api/v1/budget", get(get_fleet_budget))
@@ -92,6 +108,10 @@ pub fn build_router(state: AppState, web_dir: Option<PathBuf>) -> Router {
         .route("/api/v1/reviews", post(post_review_request))
         .route("/api/v1/queue", get(get_queue))
         .route("/api/v1/coverage/{owner}/{repo}", get(get_coverage))
+        .route(
+            "/api/v1/coverage/{owner}/{repo}/revue",
+            post(post_revue_coverage),
+        )
         .route("/api/v1/findings", get(get_findings))
         .route("/api/v1/findings/{id}", patch(patch_finding))
         .route("/api/v1/settings", get(get_settings).patch(patch_settings))
@@ -186,8 +206,14 @@ async fn post_webhook(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown");
 
-    let outcome = handle_webhook_event(&state.db, state.ntfy.as_ref(), event, &body)
-        .await
+    let outcome = handle_webhook_event(
+        &state.db,
+        state.ntfy.as_ref(),
+        state.revue.as_ref(),
+        event,
+        &body,
+    )
+    .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -366,9 +392,48 @@ async fn post_review_request(
     State(state): State<AppState>,
     Json(req): Json<CreateReviewRequest>,
 ) -> Result<(StatusCode, Json<QueueRow>), (StatusCode, String)> {
-    let (kind, paths_json) = if req.full.unwrap_or(false) {
-        ("full", None)
-    } else if let Some(paths) = req.paths {
+    if req.full.unwrap_or(false) {
+        let cov_files = state
+            .db
+            .list_file_coverage(&req.repo)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let file_cap = state
+            .db
+            .list_repos()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .into_iter()
+            .find(|r| format!("{}/{}", r.owner, r.name) == req.repo)
+            .map(|r| usize::try_from(r.file_cap.max(1)).unwrap_or(50))
+            .unwrap_or(50);
+
+        let batches = split_full_repo_batches(&cov_files, file_cap);
+        if batches.is_empty() {
+            let row = state
+                .db
+                .enqueue_review(&req.repo, "full", None, None)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            return Ok((StatusCode::CREATED, Json(row)));
+        }
+        let mut first_row: Option<QueueRow> = None;
+        for b in batches {
+            let paths: Vec<String> = b.files.into_iter().map(|f| f.path).collect();
+            let paths_json = serde_json::to_string(&paths).unwrap_or_default();
+            let row = state
+                .db
+                .enqueue_review(&req.repo, "full", None, Some(&paths_json))
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            if first_row.is_none() {
+                first_row = Some(row);
+            }
+        }
+        return Ok((StatusCode::CREATED, Json(first_row.expect("non-empty batches"))));
+    }
+
+    let (kind, paths_json) = if let Some(paths) = req.paths {
         ("proactive", Some(serde_json::to_string(&paths).unwrap_or_default()))
     } else {
         ("on-demand", None)
@@ -404,6 +469,45 @@ async fn get_coverage(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(coverage::summarize(&full, &files, Timestamp::now())))
+}
+
+async fn post_revue_coverage(
+    State(state): State<AppState>,
+    Path((owner, repo)): Path<(String, String)>,
+    Json(report): Json<RevueCoverageReport>,
+) -> Result<Json<CoverageSummary>, (StatusCode, String)> {
+    let full = format!("{owner}/{repo}");
+    let existing = state
+        .db
+        .list_file_coverage(&full)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut map: HashMap<_, _> = existing.into_iter().map(|f| (f.path.clone(), f)).collect();
+    let changes: Vec<CommitFileChange> = report
+        .paths
+        .into_iter()
+        .map(|p| CommitFileChange {
+            path: p.path,
+            blob_sha: p.blob_sha,
+            lines_changed: 0,
+            removed: false,
+        })
+        .collect();
+    apply_commit_changes(
+        &mut map,
+        &changes,
+        &CommitVerdict::Reviewed {
+            by: "revue".to_string(),
+            commit_sha: report.commit_sha,
+        },
+    );
+    let upserts: Vec<_> = map.into_values().collect();
+    state
+        .db
+        .commit_coverage_batch(&full, &[], &upserts, None)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(coverage::summarize(&full, &upserts, Timestamp::now())))
 }
 
 async fn get_findings(

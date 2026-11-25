@@ -80,6 +80,84 @@ pub fn select_proactive_batch(
     }
 }
 
+/// Split all non-excluded files in a repo into area-grouped batches for full-repo review mode,
+/// treating every file as never reviewed (`reviewed_blob = None`).
+pub fn split_full_repo_batches(
+    files: &[FileCoverageState],
+    max_files: usize,
+) -> Vec<ProactiveBatch> {
+    let cap = max_files.max(1);
+    let mut by_area: BTreeMap<String, Vec<FileCoverageState>> = BTreeMap::new();
+    for f in files {
+        if f.excluded {
+            continue;
+        }
+        let mut full_file = f.clone();
+        full_file.reviewed_blob = None;
+        full_file.reviewed_commit = None;
+        by_area
+            .entry(area_for_path(&f.path))
+            .or_default()
+            .push(full_file);
+    }
+
+    let mut batches = Vec::new();
+    for (area, mut area_files) in by_area {
+        area_files.sort_by(|a, b| a.path.cmp(&b.path));
+        for (idx, chunk) in area_files.chunks(cap).enumerate() {
+            let chunk_area = if area_files.len() > cap {
+                format!("{area}-p{}", idx + 1)
+            } else {
+                area.clone()
+            };
+            let total_lines = chunk.iter().map(|f| f.unreviewed_lines.max(1)).sum();
+            batches.push(ProactiveBatch {
+                area: chunk_area,
+                files: chunk.to_vec(),
+                total_lines,
+            });
+        }
+    }
+    batches
+}
+
+/// Build a `ProactiveBatch` from an explicit queued path list (`full` or `proactive` queue item).
+pub fn batch_from_paths(
+    paths: &[String],
+    files: &[FileCoverageState],
+    force_full: bool,
+) -> Option<ProactiveBatch> {
+    if paths.is_empty() {
+        return None;
+    }
+    let by_path: HashMap<&str, &FileCoverageState> =
+        files.iter().map(|f| (f.path.as_str(), f)).collect();
+    let mut selected = Vec::with_capacity(paths.len());
+    for p in paths {
+        let mut st = by_path.get(p.as_str()).map(|f| (*f).clone()).unwrap_or(FileCoverageState {
+            path: p.clone(),
+            reviewed_blob: None,
+            reviewed_commit: None,
+            by: None,
+            unreviewed_lines: 1,
+            unreviewed_since: None,
+            excluded: false,
+        });
+        if force_full {
+            st.reviewed_blob = None;
+            st.reviewed_commit = None;
+        }
+        selected.push(st);
+    }
+    let area = area_for_path(&selected[0].path);
+    let total_lines = selected.iter().map(|f| f.unreviewed_lines.max(1)).sum();
+    Some(ProactiveBatch {
+        area,
+        files: selected,
+        total_lines,
+    })
+}
+
 /// Build the synthetic base tree from the current default-branch entries (`path, mode, type, sha`):
 /// - Unchanged blobs and submodule gitlinks (`commit`) keep their current entry.
 /// - Batch files with a `reviewed_blob` revert to that blob (diff = only unreviewed changes).

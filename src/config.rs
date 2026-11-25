@@ -45,6 +45,8 @@ pub struct Config {
     pub github_api_base: String,
     pub ntfy_url: Option<String>,
     pub ntfy_token: Option<String>,
+    pub revue_url: Option<String>,
+    pub revue_token: Option<String>,
 }
 
 impl Default for Config {
@@ -66,6 +68,8 @@ impl Default for Config {
             github_api_base: "https://api.github.com".to_string(),
             ntfy_url: None,
             ntfy_token: None,
+            revue_url: None,
+            revue_token: None,
         }
     }
 }
