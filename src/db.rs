@@ -188,6 +188,48 @@ impl Db {
         Ok(rows)
     }
 
+    /// Remove a repository and its per-repo tracking state (used when a repo is
+    /// discovered to be a fork, archived, or private).
+    pub async fn delete_repo(&self, owner: &str, name: &str) -> Result<bool> {
+        let _cov_guard = self.coverage_lock.lock().await;
+        let full_name = format!("{owner}/{name}");
+        let mut tx = self.pool.begin().await?;
+        let res = sqlx::query("DELETE FROM repos WHERE owner = ?1 AND name = ?2")
+            .bind(owner)
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        let removed = res.rows_affected() > 0;
+        if removed {
+            for stmt in [
+                "DELETE FROM budget_state WHERE repo = ?1",
+                "DELETE FROM queue WHERE repo = ?1",
+                "DELETE FROM review_runs WHERE repo = ?1",
+                "DELETE FROM file_coverage WHERE repo = ?1",
+                "DELETE FROM scan_cursor WHERE repo = ?1",
+                "DELETE FROM findings WHERE repo = ?1",
+                "DELETE FROM demand_hist WHERE repo = ?1",
+            ] {
+                sqlx::query(stmt).bind(&full_name).execute(&mut *tx).await?;
+            }
+            let escaped = full_name
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            let etag_prefix = format!("%/repos/{escaped}/%");
+            let etag_exact = format!("%/repos/{escaped}");
+            sqlx::query(
+                "DELETE FROM poll_etags WHERE url LIKE ?1 ESCAPE '\\' OR url LIKE ?2 ESCAPE '\\'",
+            )
+            .bind(&etag_prefix)
+            .bind(&etag_exact)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(removed)
+    }
+
     pub async fn record_observation(
         &self,
         repo: &str,
@@ -1030,6 +1072,15 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    pub async fn count_open_proactive_runs_fleet(&self) -> Result<u32> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM review_runs WHERE kind = 'proactive' AND finished_at IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(u32::try_from(count.max(0)).unwrap_or(0))
     }
 
     pub async fn count_proactive_today(&self, repo: Option<&str>, now: Timestamp) -> Result<u32> {

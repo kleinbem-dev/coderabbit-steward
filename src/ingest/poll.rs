@@ -9,10 +9,10 @@ use crate::parse::review::parse_pr_review;
 use anyhow::{Context, Result};
 use jiff::Timestamp;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use reqwest::header::{AUTHORIZATION, ETAG, IF_NONE_MATCH, USER_AGENT};
+use reqwest::header::{ACCEPT, AUTHORIZATION, ETAG, IF_NONE_MATCH, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -48,6 +48,7 @@ struct GhRepo {
     stargazers_count: i64,
     default_branch: Option<String>,
     archived: Option<bool>,
+    fork: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,15 +234,54 @@ impl GitHubPoller {
                 }
             };
 
-            let repos_url = format!(
+            let mut seen_names: HashSet<String> = HashSet::new();
+            let mut listing_complete = true;
+            let mut next_url: Option<String> = Some(format!(
                 "{}/users/{owner}/repos?per_page=100&type=owner",
                 self.config.github_api_base
-            );
-            if let Some(val) = self.get_with_etag(&repos_url, &token).await?
-                && let Ok(repos) = serde_json::from_value::<Vec<GhRepo>>(val)
-            {
+            ));
+            while let Some(url) = next_url.take() {
+                let resp = self
+                    .client
+                    .get(&url)
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header(ACCEPT, "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
+                    .send()
+                    .await?;
+                if !resp.status().is_success() {
+                    warn!(owner, url = %url, status = %resp.status(), "repo discovery page failed");
+                    listing_complete = false;
+                    break;
+                }
+                next_url = parse_next_link(
+                    resp.headers()
+                        .get("link")
+                        .and_then(|v| v.to_str().ok()),
+                );
+                let repos: Vec<GhRepo> = match resp.json().await {
+                    Ok(r) => r,
+                    Err(err) => {
+                        warn!(owner, error = %err, "failed to decode repo discovery page");
+                        listing_complete = false;
+                        break;
+                    }
+                };
                 for repo in repos {
-                    if repo.archived.unwrap_or(false) || repo.is_private {
+                    seen_names.insert(repo.name.to_ascii_lowercase());
+                    if repo.archived.unwrap_or(false)
+                        || repo.is_private
+                        || repo.fork.unwrap_or(false)
+                    {
+                        if self.db.delete_repo(&repo.owner.login, &repo.name).await? {
+                            info!(
+                                repo = %format!("{}/{}", repo.owner.login, repo.name),
+                                archived = repo.archived.unwrap_or(false),
+                                private = repo.is_private,
+                                fork = repo.fork.unwrap_or(false),
+                                "removed excluded repository from tracking"
+                            );
+                        }
                         continue;
                     }
                     let branch = repo.default_branch.as_deref().unwrap_or("main");
@@ -254,6 +294,45 @@ impl GitHubPoller {
                             branch,
                         )
                         .await?;
+                }
+            }
+
+            if listing_complete {
+                let existing = self.db.list_repos().await?;
+                for repo in existing
+                    .into_iter()
+                    .filter(|r| r.owner.eq_ignore_ascii_case(&owner))
+                {
+                    if seen_names.contains(&repo.name.to_ascii_lowercase()) {
+                        continue;
+                    }
+                    let check_url = format!(
+                        "{}/repos/{}/{}",
+                        self.config.github_api_base, repo.owner, repo.name
+                    );
+                    let resp = self
+                        .client
+                        .get(&check_url)
+                        .header(AUTHORIZATION, format!("Bearer {token}"))
+                        .header(ACCEPT, "application/vnd.github+json")
+                        .header("X-GitHub-Api-Version", "2022-11-28")
+                        .send()
+                        .await?;
+                    let should_purge = if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                        true
+                    } else if resp.status().is_success() {
+                        resp.json::<GhRepo>().await.ok().is_some_and(|r| {
+                            r.is_private || r.archived.unwrap_or(false) || r.fork.unwrap_or(false)
+                        })
+                    } else {
+                        false
+                    };
+                    if should_purge && self.db.delete_repo(&repo.owner, &repo.name).await? {
+                        info!(
+                            repo = %format!("{}/{}", repo.owner, repo.name),
+                            "removed inaccessible or newly excluded repository from tracking"
+                        );
+                    }
                 }
             }
 
@@ -906,4 +985,18 @@ enum ReviewCheckStatus {
     Reviewed,
     Pending,
     NotReviewed,
+}
+
+fn parse_next_link(header: Option<&str>) -> Option<String> {
+    let header = header?;
+    for part in header.split(',') {
+        let mut segments = part.split(';').map(str::trim);
+        let url_part = segments.next()?;
+        if segments.any(|s| s == r#"rel="next""#)
+            && let Some(url) = url_part.strip_prefix('<').and_then(|u| u.strip_suffix('>'))
+        {
+            return Some(url.to_string());
+        }
+    }
+    None
 }
