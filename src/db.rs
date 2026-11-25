@@ -1,8 +1,9 @@
 use crate::budget::{BudgetLedger, Confidence, SpendRecord, SpendState};
 use crate::config::Mode;
 use crate::coverage::FileCoverageState;
+use crate::findings::{ParsedFinding, compute_fingerprint};
 use anyhow::{Context, Result};
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{FromRow, SqlitePool};
@@ -100,6 +101,18 @@ pub struct SettingsRow {
     pub quiet_minutes: i64,
     pub pooled: i64,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ReviewRunRow {
+    pub id: i64,
+    pub repo: String,
+    pub pr_number: i64,
+    pub head_sha: String,
+    pub kind: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub outcome: Option<String>,
 }
 
 impl Db {
@@ -798,5 +811,180 @@ impl Db {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Insert or update a finding deduplicated by `(repo, fingerprint)`, preserving existing status.
+    /// Returns `(finding_id, is_new)`.
+    pub async fn upsert_finding(
+        &self,
+        repo: &str,
+        finding: &ParsedFinding,
+        commit_sha: Option<&str>,
+        review_run: Option<i64>,
+    ) -> Result<(i64, bool)> {
+        let fp = compute_fingerprint(repo, &finding.path, &finding.title, &finding.code_quote);
+        let existing: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM findings WHERE repo = ?1 AND fingerprint = ?2 LIMIT 1",
+        )
+        .bind(repo)
+        .bind(&fp)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(id) = existing {
+            sqlx::query(
+                "UPDATE findings SET line = ?1, commit_sha = COALESCE(?2, commit_sha), body = ?3, review_run = COALESCE(?4, review_run)
+                 WHERE id = ?5",
+            )
+            .bind(finding.line)
+            .bind(commit_sha)
+            .bind(&finding.body)
+            .bind(review_run)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+            return Ok((id, false));
+        }
+
+        let now = now_rfc3339();
+        let id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO findings (repo, path, line, commit_sha, severity, category, title, body, fingerprint, status, review_run, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'new', ?10, ?11)
+             RETURNING id",
+        )
+        .bind(repo)
+        .bind(&finding.path)
+        .bind(finding.line)
+        .bind(commit_sha)
+        .bind(&finding.severity)
+        .bind(&finding.category)
+        .bind(&finding.title)
+        .bind(&finding.body)
+        .bind(&fp)
+        .bind(review_run)
+        .bind(&now)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((id, true))
+    }
+
+    pub async fn get_findings_issue_number(&self, repo: &str) -> Result<Option<i64>> {
+        let num = sqlx::query_scalar(
+            "SELECT issue_number FROM findings WHERE repo = ?1 AND issue_number IS NOT NULL ORDER BY id DESC LIMIT 1",
+        )
+        .bind(repo)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(num)
+    }
+
+    pub async fn set_findings_issue_number(&self, repo: &str, issue_number: i64) -> Result<()> {
+        sqlx::query("UPDATE findings SET issue_number = ?1 WHERE repo = ?2")
+            .bind(issue_number)
+            .bind(repo)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn record_review_run(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        head_sha: &str,
+        kind: &str,
+        metadata: Option<&str>,
+    ) -> Result<i64> {
+        let now = now_rfc3339();
+        let id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO review_runs (repo, pr_number, head_sha, kind, started_at, outcome)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) RETURNING id",
+        )
+        .bind(repo)
+        .bind(pr_number)
+        .bind(head_sha)
+        .bind(kind)
+        .bind(&now)
+        .bind(metadata)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    pub async fn finish_review_run(&self, id: i64, outcome: &str) -> Result<()> {
+        let now = now_rfc3339();
+        sqlx::query("UPDATE review_runs SET finished_at = ?1, outcome = ?2 WHERE id = ?3")
+            .bind(&now)
+            .bind(outcome)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_open_proactive_runs(&self, repo: &str) -> Result<Vec<ReviewRunRow>> {
+        let rows = sqlx::query_as::<_, ReviewRunRow>(
+            "SELECT id, repo, pr_number, head_sha, kind, started_at, finished_at, outcome
+             FROM review_runs
+             WHERE repo = ?1 AND kind = 'proactive' AND finished_at IS NULL
+             ORDER BY id ASC",
+        )
+        .bind(repo)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn count_proactive_today(&self, repo: Option<&str>, now: Timestamp) -> Result<u32> {
+        let cutoff = (now - SignedDuration::from_hours(24)).to_string();
+        let count: i64 = match repo {
+            Some(r) => {
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM review_runs
+                     WHERE repo = ?1 AND kind = 'proactive' AND started_at >= ?2",
+                )
+                .bind(r)
+                .bind(&cutoff)
+                .fetch_one(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM review_runs
+                     WHERE kind = 'proactive' AND started_at >= ?1",
+                )
+                .bind(&cutoff)
+                .fetch_one(&self.pool)
+                .await?
+            }
+        };
+        Ok(u32::try_from(count.max(0)).unwrap_or(0))
+    }
+
+    pub async fn quiet_minutes_for_repo(&self, repo: &str, now: Timestamp) -> Result<u32> {
+        let latest_obs: Option<String> =
+            sqlx::query_scalar("SELECT MAX(seen_at) FROM observations WHERE repo = ?1")
+                .bind(repo)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten();
+        let latest_spend: Option<String> =
+            sqlx::query_scalar("SELECT MAX(at) FROM spends WHERE repo = ?1")
+                .bind(repo)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten();
+        let latest = [latest_obs, latest_spend]
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.parse::<Timestamp>().ok())
+            .max();
+        Ok(match latest {
+            Some(ts) => {
+                let mins = now.duration_since(ts).as_secs().max(0) / 60;
+                u32::try_from(mins).unwrap_or(u32::MAX)
+            }
+            None => 9999,
+        })
     }
 }
