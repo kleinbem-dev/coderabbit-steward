@@ -48,6 +48,7 @@ struct GhRepo {
     stargazers_count: i64,
     default_branch: Option<String>,
     archived: Option<bool>,
+    fork: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,15 +234,32 @@ impl GitHubPoller {
                 }
             };
 
-            let repos_url = format!(
-                "{}/users/{owner}/repos?per_page=100&type=owner",
-                self.config.github_api_base
-            );
-            if let Some(val) = self.get_with_etag(&repos_url, &token).await?
-                && let Ok(repos) = serde_json::from_value::<Vec<GhRepo>>(val)
-            {
+            for page in 1u32..=10 {
+                let repos_url = format!(
+                    "{}/users/{owner}/repos?per_page=100&type=owner&page={page}",
+                    self.config.github_api_base
+                );
+                let Some(val) = self.get_with_etag(&repos_url, &token).await? else {
+                    break;
+                };
+                let Ok(repos) = serde_json::from_value::<Vec<GhRepo>>(val) else {
+                    break;
+                };
+                let count = repos.len();
                 for repo in repos {
-                    if repo.archived.unwrap_or(false) || repo.is_private {
+                    if repo.archived.unwrap_or(false)
+                        || repo.is_private
+                        || repo.fork.unwrap_or(false)
+                    {
+                        if self.db.delete_repo(&repo.owner.login, &repo.name).await? {
+                            info!(
+                                repo = %format!("{}/{}", repo.owner.login, repo.name),
+                                archived = repo.archived.unwrap_or(false),
+                                private = repo.is_private,
+                                fork = repo.fork.unwrap_or(false),
+                                "removed excluded repository from tracking"
+                            );
+                        }
                         continue;
                     }
                     let branch = repo.default_branch.as_deref().unwrap_or("main");
@@ -254,6 +272,9 @@ impl GitHubPoller {
                             branch,
                         )
                         .await?;
+                }
+                if count < 100 {
+                    break;
                 }
             }
 

@@ -137,4 +137,11 @@ async fn full_review_enqueues_batches_and_revue_endpoint_updates_coverage() {
     let src_a = files.iter().find(|f| f.path == "src/a.rs").unwrap();
     assert_eq!(src_a.by.as_deref(), Some("revue"));
     assert_eq!(src_a.unreviewed_lines, 0);
+
+    // 3. Removing an excluded repo (e.g. fork/archived) purges its queue and coverage
+    assert!(db.delete_repo("kleinbem", "demo").await.unwrap());
+    assert!(!db.delete_repo("kleinbem", "demo").await.unwrap());
+    assert!(db.list_repos().await.unwrap().is_empty());
+    assert!(db.list_queue(Some("kleinbem/demo")).await.unwrap().is_empty());
+    assert!(db.list_file_coverage("kleinbem/demo").await.unwrap().is_empty());
 }

@@ -188,6 +188,34 @@ impl Db {
         Ok(rows)
     }
 
+    /// Remove a repository and its per-repo tracking state (used when a repo is
+    /// discovered to be a fork, archived, or private).
+    pub async fn delete_repo(&self, owner: &str, name: &str) -> Result<bool> {
+        let _cov_guard = self.coverage_lock.lock().await;
+        let full_name = format!("{owner}/{name}");
+        let mut tx = self.pool.begin().await?;
+        let res = sqlx::query("DELETE FROM repos WHERE owner = ?1 AND name = ?2")
+            .bind(owner)
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        let removed = res.rows_affected() > 0;
+        if removed {
+            for stmt in [
+                "DELETE FROM budget_state WHERE repo = ?1",
+                "DELETE FROM queue WHERE repo = ?1",
+                "DELETE FROM file_coverage WHERE repo = ?1",
+                "DELETE FROM scan_cursor WHERE repo = ?1",
+                "DELETE FROM findings WHERE repo = ?1",
+                "DELETE FROM demand_hist WHERE repo = ?1",
+            ] {
+                sqlx::query(stmt).bind(&full_name).execute(&mut *tx).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(removed)
+    }
+
     pub async fn record_observation(
         &self,
         repo: &str,
