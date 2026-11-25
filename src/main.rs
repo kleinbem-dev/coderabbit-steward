@@ -549,32 +549,34 @@ async fn run_scheduler_tick(
                     && q.created_at
                         .parse::<Timestamp>()
                         .is_ok_and(|ts| ts < revue_wait_cutoff)
-                    && revue_offered.insert(q.id)
+                    && !revue_offered.contains(&q.id)
+                    && revue_client.trigger_advisory_review(&full, pr, "queue-wait-90m")
                 {
-                    revue_client.trigger_advisory_review(&full, pr, "queue-wait-90m");
+                    revue_offered.insert(q.id);
                 }
             }
         }
 
         let cov_files = db.list_file_coverage(&full).await?;
-        let queued_batch_row = active
+        let queued_choice = active
             .iter()
-            .find(|q| q.state == "waiting" && (q.kind == "full" || q.kind == "proactive"));
-        let queued_batch = queued_batch_row.and_then(|q| {
-            let paths: Vec<String> = q
-                .paths_json
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or_default();
-            batch_from_paths(&paths, &cov_files, q.kind == "full")
-        });
-        let proactive_batch = queued_batch.or_else(|| {
+            .filter(|q| q.state == "waiting" && (q.kind == "full" || q.kind == "proactive"))
+            .find_map(|q| {
+                let paths: Vec<String> = q
+                    .paths_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_default();
+                batch_from_paths(&paths, &cov_files, q.kind == "full").map(|b| (Some(q.id), b))
+            });
+        let proactive_choice = queued_choice.or_else(|| {
             select_proactive_batch(
                 &cov_files,
                 now,
                 usize::try_from(repo.file_cap.max(1)).unwrap_or(50),
                 2000,
             )
+            .map(|b| (None, b))
         });
         let quiet_for_minutes = db.quiet_minutes_for_repo(&full, now).await?;
         let proactive_today_repo = db.count_proactive_today(Some(&full), now).await?;
@@ -594,7 +596,7 @@ async fn run_scheduler_tick(
             repo_daily_cap: u32::try_from(settings.repo_daily_cap.max(0)).unwrap_or(6),
             proactive_today_fleet,
             fleet_daily_cap: u32::try_from(settings.fleet_daily_cap.max(0)).unwrap_or(40),
-            has_proactive_candidate: proactive_batch.is_some(),
+            has_proactive_candidate: proactive_choice.is_some(),
         };
 
         match decide(&input) {
@@ -670,7 +672,7 @@ async fn run_scheduler_tick(
                 debug!(repo = %full, %reason, "scheduler idle");
             }
             ScheduledAction::TriggerProactive => {
-                if let Some(batch) = proactive_batch {
+                if let Some((queued_id, batch)) = proactive_choice {
                     info!(
                         repo = %full,
                         area = %batch.area,
@@ -693,8 +695,8 @@ async fn run_scheduler_tick(
                                 Some(&branch_meta),
                             )
                             .await?;
-                            if let Some(q) = queued_batch_row {
-                                let _ = db.update_queue_state(q.id, "done", None).await;
+                            if let Some(qid) = queued_id {
+                                let _ = db.update_queue_state(qid, "done", None).await;
                             }
                             proactive_today_fleet += 1;
                             info!(

@@ -19,6 +19,7 @@ pub fn now_rfc3339() -> String {
 pub struct Db {
     pub pool: SqlitePool,
     ledger_lock: Arc<Mutex<()>>,
+    coverage_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -134,6 +135,7 @@ impl Db {
         Ok(Self {
             pool,
             ledger_lock: Arc::new(Mutex::new(())),
+            coverage_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -405,6 +407,43 @@ impl Db {
         .bind(id)
         .fetch_one(&self.pool)
         .await?;
+        Ok(row)
+    }
+
+    /// Atomically enqueue multiple batch rows (e.g. full-repo area batches) in one transaction.
+    pub async fn enqueue_review_batches(
+        &self,
+        repo: &str,
+        kind: &str,
+        batches_json: &[String],
+    ) -> Result<QueueRow> {
+        let now = now_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        let mut first_id: Option<i64> = None;
+        for paths_json in batches_json {
+            let id = sqlx::query_scalar::<_, i64>(
+                "INSERT INTO queue (repo, kind, pr_number, paths_json, state, created_at, updated_at)
+                 VALUES (?1, ?2, NULL, ?3, 'waiting', ?4, ?4) RETURNING id",
+            )
+            .bind(repo)
+            .bind(kind)
+            .bind(paths_json)
+            .bind(&now)
+            .fetch_one(&mut *tx)
+            .await?;
+            if first_id.is_none() {
+                first_id = Some(id);
+            }
+        }
+        let first_id = first_id.context("batches_json must be non-empty")?;
+        let row = sqlx::query_as::<_, QueueRow>(
+            "SELECT id, repo, kind, pr_number, paths_json, priority, state, not_before, created_at, updated_at
+             FROM queue WHERE id = ?1",
+        )
+        .bind(first_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(row)
     }
 
@@ -766,6 +805,7 @@ impl Db {
         upserts: &[FileCoverageState],
         new_cursor: Option<&str>,
     ) -> Result<()> {
+        let _guard = self.coverage_lock.lock().await;
         let mut tx = self.pool.begin().await?;
         for path in deleted_paths {
             sqlx::query("DELETE FROM file_coverage WHERE repo = ?1 AND path = ?2")
@@ -811,6 +851,63 @@ impl Db {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Serialised read-modify-write for Revue coverage reports: only touches reported paths and
+    /// preserves newer unreviewed changes if the report is for a stale commit/blob.
+    pub async fn apply_revue_coverage(
+        &self,
+        repo: &str,
+        commit_sha: &str,
+        reported: &[(String, Option<String>)],
+    ) -> Result<Vec<FileCoverageState>> {
+        let _guard = self.coverage_lock.lock().await;
+        let mut tx = self.pool.begin().await?;
+        for (path, blob_sha) in reported {
+            if crate::coverage::is_excluded_path(path) {
+                continue;
+            }
+            let existing: Option<(Option<String>, Option<String>, i64)> = sqlx::query_as(
+                "SELECT reviewed_blob, reviewed_commit, unreviewed_lines
+                 FROM file_coverage WHERE repo = ?1 AND path = ?2",
+            )
+            .bind(repo)
+            .bind(path)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            // If an existing row already has a different reviewed_commit and newer unreviewed
+            // lines, and the incoming report's blob does not match, avoid clearing newer changes.
+            if let Some((ref cur_blob, Some(ref cur_commit), unrev)) = existing
+                && cur_commit != commit_sha
+                && unrev > 0
+                && blob_sha.is_some()
+                && cur_blob.as_deref() != blob_sha.as_deref()
+            {
+                continue;
+            }
+
+            sqlx::query(
+                "INSERT INTO file_coverage (repo, path, reviewed_blob, reviewed_commit, by, unreviewed_lines, unreviewed_since, excluded)
+                 VALUES (?1, ?2, ?3, ?4, 'revue', 0, NULL, 0)
+                 ON CONFLICT(repo, path) DO UPDATE SET
+                   reviewed_blob = COALESCE(excluded.reviewed_blob, file_coverage.reviewed_blob),
+                   reviewed_commit = excluded.reviewed_commit,
+                   by = 'revue',
+                   unreviewed_lines = 0,
+                   unreviewed_since = NULL,
+                   excluded = 0",
+            )
+            .bind(repo)
+            .bind(path)
+            .bind(blob_sha)
+            .bind(commit_sha)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        drop(_guard);
+        self.list_file_coverage(repo).await
     }
 
     /// Insert or update a finding deduplicated by `(repo, fingerprint)`, preserving existing status.

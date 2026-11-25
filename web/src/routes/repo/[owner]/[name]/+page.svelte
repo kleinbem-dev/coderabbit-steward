@@ -6,6 +6,8 @@
 	let detail = $state<RepoDetail | null>(null);
 	let error = $state<string | null>(null);
 	let prInput = $state('');
+	let prBusy = $state(false);
+	let fullBusy = $state(false);
 	let actionMsg = $state<string | null>(null);
 
 	const owner = $derived(page.params.owner);
@@ -21,8 +23,10 @@
 	}
 
 	async function queuePr() {
-		const pr = Number.parseInt(prInput, 10);
-		if (!Number.isFinite(pr) || pr <= 0) return;
+		if (prBusy) return;
+		const pr = Number(prInput.trim());
+		if (!Number.isSafeInteger(pr) || pr <= 0) return;
+		prBusy = true;
 		actionMsg = null;
 		try {
 			await apiFetch('/api/v1/reviews', {
@@ -35,10 +39,14 @@
 			await load();
 		} catch (e) {
 			actionMsg = e instanceof Error ? e.message : String(e);
+		} finally {
+			prBusy = false;
 		}
 	}
 
 	async function queueFullRepo() {
+		if (fullBusy) return;
+		fullBusy = true;
 		actionMsg = null;
 		try {
 			await apiFetch('/api/v1/reviews', {
@@ -50,6 +58,8 @@
 			await load();
 		} catch (e) {
 			actionMsg = e instanceof Error ? e.message : String(e);
+		} finally {
+			fullBusy = false;
 		}
 	}
 
@@ -66,18 +76,21 @@
 			<input
 				type="number"
 				min="1"
+				step="1"
 				placeholder="PR #"
 				bind:value={prInput}
 				class="w-24 px-2 py-1 rounded border border-[var(--border)] bg-transparent"
 			/>
 			<button
-				class="px-3 py-1 rounded border border-[var(--border)] hover:bg-[var(--bg-subtle)]"
+				class="px-3 py-1 rounded border border-[var(--border)] hover:bg-[var(--bg-subtle)] disabled:opacity-50"
+				disabled={prBusy}
 				onclick={queuePr}
 			>
 				Queue PR
 			</button>
 			<button
-				class="px-3 py-1 rounded border border-[var(--border)] hover:bg-[var(--bg-subtle)]"
+				class="px-3 py-1 rounded border border-[var(--border)] hover:bg-[var(--bg-subtle)] disabled:opacity-50"
+				disabled={fullBusy}
 				onclick={queueFullRepo}
 			>
 				Full Repo Review
