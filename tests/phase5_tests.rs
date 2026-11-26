@@ -116,6 +116,7 @@ async fn full_review_enqueues_batches_and_revue_endpoint_updates_coverage() {
 
     // 2. Revue reports reviewed coverage for src/a.rs -> coverage jumps to 50% with by='revue'
     let resp = router
+        .clone()
         .oneshot(
             Request::post("/api/v1/coverage/kleinbem/demo/revue")
                 .header("Content-Type", "application/json")
@@ -132,6 +133,66 @@ async fn full_review_enqueues_batches_and_revue_endpoint_updates_coverage() {
             .unwrap();
     assert_eq!(body["reviewed_files"], 1);
     assert_eq!(body["percentage"], 50.0);
+
+    // 2b. Settings caps and per-repo proactive toggle work via PATCH
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::patch("/api/v1/settings")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    r#"{"repo_daily_cap":4,"fleet_daily_cap":20,"quiet_minutes":30}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let s: Value =
+        serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(s["repo_daily_cap"], 4);
+    assert_eq!(s["fleet_daily_cap"], 20);
+    assert_eq!(s["quiet_minutes"], 30);
+
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::patch("/api/v1/repo/kleinbem/demo")
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"proactive_enabled":false}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let repos = db.list_repos().await.unwrap();
+    assert_eq!(repos[0].proactive_enabled, 0);
+
+    // 2c. Delete a single queue item, then clear the remaining waiting queue
+    let first_id = queue[0].id;
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::delete(format!("/api/v1/queue/{first_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(db.list_queue(Some("kleinbem/demo")).await.unwrap().len(), 1);
+
+    let resp = router
+        .oneshot(
+            Request::delete("/api/v1/repo/kleinbem/demo/queue")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(db.list_queue(Some("kleinbem/demo")).await.unwrap().is_empty());
 
     let files = db.list_file_coverage("kleinbem/demo").await.unwrap();
     let src_a = files.iter().find(|f| f.path == "src/a.rs").unwrap();

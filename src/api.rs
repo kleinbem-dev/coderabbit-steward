@@ -45,12 +45,14 @@ pub struct FleetRepoBudget {
     pub queue_length: usize,
     pub coverage_pct: f64,
     pub open_findings: usize,
+    pub proactive_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct RepoDetailResponse {
     pub repo: String,
     pub stars: i64,
+    pub proactive_enabled: bool,
     pub budget: BudgetSnapshot,
     pub coverage: CoverageSummary,
     pub spends: Vec<SpendRow>,
@@ -85,6 +87,14 @@ pub struct PatchFindingRequest {
 #[derive(Debug, Deserialize)]
 pub struct PatchSettingsRequest {
     pub mode: Option<String>,
+    pub repo_daily_cap: Option<i64>,
+    pub fleet_daily_cap: Option<i64>,
+    pub quiet_minutes: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PatchRepoRequest {
+    pub proactive_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,9 +113,20 @@ pub fn build_router(state: AppState, web_dir: Option<PathBuf>) -> Router {
     let protected = Router::new()
         .route("/api/v1/budget", get(get_fleet_budget))
         .route("/api/v1/budget/{owner}/{repo}", get(get_repo_budget))
-        .route("/api/v1/repo/{owner}/{repo}", get(get_repo_detail))
+        .route(
+            "/api/v1/repo/{owner}/{repo}",
+            get(get_repo_detail).patch(patch_repo),
+        )
+        .route(
+            "/api/v1/repo/{owner}/{repo}/queue",
+            axum::routing::delete(clear_repo_queue),
+        )
         .route("/api/v1/reviews", post(post_review_request))
         .route("/api/v1/queue", get(get_queue))
+        .route(
+            "/api/v1/queue/{id}",
+            axum::routing::delete(delete_queue_item),
+        )
         .route("/api/v1/coverage/{owner}/{repo}", get(get_coverage))
         .route(
             "/api/v1/coverage/{owner}/{repo}/revue",
@@ -314,6 +335,7 @@ async fn get_fleet_budget(
             queue_length: q_len,
             coverage_pct: cov_pct,
             open_findings: open_f,
+            proactive_enabled: r.proactive_enabled != 0,
         });
     }
 
@@ -344,11 +366,9 @@ async fn get_repo_detail(
         .list_repos()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let stars = repos
-        .into_iter()
-        .find(|r| r.owner == owner && r.name == repo)
-        .map(|r| r.stars)
-        .unwrap_or(0);
+    let repo_row = repos.into_iter().find(|r| r.owner == owner && r.name == repo);
+    let stars = repo_row.as_ref().map_or(0, |r| r.stars);
+    let proactive_enabled = repo_row.as_ref().is_none_or(|r| r.proactive_enabled != 0);
     let ledger = state
         .db
         .load_budget_ledger(&full)
@@ -379,6 +399,7 @@ async fn get_repo_detail(
     Ok(Json(RepoDetailResponse {
         repo: full.clone(),
         stars,
+        proactive_enabled,
         budget: ledger.snapshot(now),
         coverage: coverage::summarize(&full, &cov_files, now),
         spends,
@@ -528,21 +549,97 @@ async fn get_settings(
     Ok(Json(serde_json::json!(s)))
 }
 
+async fn delete_queue_item(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let deleted = state
+        .db
+        .delete_queue_item(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((StatusCode::NOT_FOUND, "queue item not found".to_string()))
+    }
+}
+
+async fn clear_repo_queue(
+    State(state): State<AppState>,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let full = format!("{owner}/{repo}");
+    let deleted = state
+        .db
+        .clear_repo_waiting_queue(&full)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "repo": full,
+        "deleted": deleted,
+    })))
+}
+
+async fn patch_repo(
+    State(state): State<AppState>,
+    Path((owner, repo)): Path<(String, String)>,
+    Json(req): Json<PatchRepoRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let updated = state
+        .db
+        .set_repo_proactive(&owner, &repo, req.proactive_enabled)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !updated {
+        return Err((StatusCode::NOT_FOUND, "repository not found".to_string()));
+    }
+    Ok(Json(serde_json::json!({
+        "repo": format!("{owner}/{repo}"),
+        "proactive_enabled": req.proactive_enabled,
+    })))
+}
+
 async fn patch_settings(
     State(state): State<AppState>,
     Json(req): Json<PatchSettingsRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    if let Some(m) = req.mode {
-        let mode = Mode::parse(&m).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-        state
-            .db
-            .set_mode(mode)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mode = match req.mode {
+        Some(m) => Some(Mode::parse(&m).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?),
+        None => None,
+    };
+    if let Some(cap) = req.repo_daily_cap
+        && !(0..=500).contains(&cap)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "repo_daily_cap must be between 0 and 500".to_string(),
+        ));
+    }
+    if let Some(cap) = req.fleet_daily_cap
+        && !(0..=500).contains(&cap)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "fleet_daily_cap must be between 0 and 500".to_string(),
+        ));
+    }
+    if let Some(qm) = req.quiet_minutes
+        && !(0..=1440).contains(&qm)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "quiet_minutes must be between 0 and 1440".to_string(),
+        ));
     }
     let s = state
         .db
-        .get_settings()
+        .update_settings(
+            mode,
+            req.repo_daily_cap,
+            req.fleet_daily_cap,
+            req.quiet_minutes,
+        )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!(s)))

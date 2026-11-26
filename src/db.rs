@@ -32,6 +32,7 @@ pub struct RepoRow {
     pub default_branch: String,
     pub has_coderabbit: i64,
     pub file_cap: i64,
+    pub proactive_enabled: i64,
     pub updated_at: String,
 }
 
@@ -180,12 +181,35 @@ impl Db {
 
     pub async fn list_repos(&self) -> Result<Vec<RepoRow>> {
         let rows = sqlx::query_as::<_, RepoRow>(
-            "SELECT id, owner, name, visibility, stars, default_branch, has_coderabbit, file_cap, updated_at
+            "SELECT id, owner, name, visibility, stars, default_branch, has_coderabbit, file_cap, proactive_enabled, updated_at
              FROM repos ORDER BY owner, name",
         )
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    pub async fn set_repo_proactive(&self, owner: &str, name: &str, enabled: bool) -> Result<bool> {
+        let now = now_rfc3339();
+        let res = sqlx::query(
+            "UPDATE repos SET proactive_enabled = ?1, updated_at = ?2 WHERE owner = ?3 AND name = ?4",
+        )
+        .bind(if enabled { 1i64 } else { 0i64 })
+        .bind(&now)
+        .bind(owner)
+        .bind(name)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    pub async fn list_repos_with_waiting_full(&self) -> Result<Vec<String>> {
+        let repos: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT repo FROM queue WHERE kind = 'full' AND state = 'waiting'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(repos)
     }
 
     /// Remove a repository and its per-repo tracking state (used when a repo is
@@ -512,6 +536,22 @@ impl Db {
         Ok(rows)
     }
 
+    pub async fn delete_queue_item(&self, id: i64) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM queue WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    pub async fn clear_repo_waiting_queue(&self, repo: &str) -> Result<u64> {
+        let res = sqlx::query("DELETE FROM queue WHERE repo = ?1 AND state = 'waiting'")
+            .bind(repo)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
     pub async fn list_active_queue(&self, repo: &str) -> Result<Vec<QueueRow>> {
         let rows = sqlx::query_as::<_, QueueRow>(
             "SELECT id, repo, kind, pr_number, paths_json, priority, state, not_before, created_at, updated_at
@@ -727,6 +767,33 @@ impl Db {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    pub async fn update_settings(
+        &self,
+        mode: Option<Mode>,
+        repo_daily_cap: Option<i64>,
+        fleet_daily_cap: Option<i64>,
+        quiet_minutes: Option<i64>,
+    ) -> Result<SettingsRow> {
+        let now = now_rfc3339();
+        sqlx::query(
+            "UPDATE settings
+             SET mode = COALESCE(?1, mode),
+                 repo_daily_cap = COALESCE(?2, repo_daily_cap),
+                 fleet_daily_cap = COALESCE(?3, fleet_daily_cap),
+                 quiet_minutes = COALESCE(?4, quiet_minutes),
+                 updated_at = ?5
+             WHERE id = 1",
+        )
+        .bind(mode.map(|m| m.as_str().to_string()))
+        .bind(repo_daily_cap)
+        .bind(fleet_daily_cap)
+        .bind(quiet_minutes)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        self.get_settings().await
     }
 
     pub async fn get_etag(&self, url: &str) -> Result<Option<String>> {

@@ -28,6 +28,8 @@ pub struct RepoScheduleInput {
     pub proactive_today_fleet: u32,
     pub fleet_daily_cap: u32,
     pub has_proactive_candidate: bool,
+    /// True when the proactive candidate comes from an explicit `full` review request.
+    pub is_explicit_full: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,7 +79,7 @@ pub fn decide(input: &RepoScheduleInput) -> ScheduledAction {
         };
     }
 
-    if input.mode != Mode::Full {
+    if input.mode == Mode::Observe || (!input.is_explicit_full && input.mode != Mode::Full) {
         return ScheduledAction::Idle {
             reason: format!("mode is {}", input.mode.as_str()),
         };
@@ -93,25 +95,27 @@ pub fn decide(input: &RepoScheduleInput) -> ScheduledAction {
             reason: "budget not free or confidence unknown".to_string(),
         };
     }
-    if input.budget.limit > 1 && input.budget.remaining <= 1 {
-        return ScheduledAction::Idle {
-            reason: "keeping 1 slot in reserve".to_string(),
-        };
-    }
-    if input.quiet_for_minutes < input.required_quiet_minutes {
-        return ScheduledAction::Idle {
-            reason: "repo not quiet long enough".to_string(),
-        };
-    }
-    if input.predicted_demand >= 0.15 {
-        return ScheduledAction::Idle {
-            reason: "predicted demand too high".to_string(),
-        };
-    }
-    if input.open_unlabelled_risky_pr {
-        return ScheduledAction::Idle {
-            reason: "open unlabelled risky PR present".to_string(),
-        };
+    if !input.is_explicit_full {
+        if input.budget.limit > 1 && input.budget.remaining <= 1 {
+            return ScheduledAction::Idle {
+                reason: "keeping 1 slot in reserve".to_string(),
+            };
+        }
+        if input.quiet_for_minutes < input.required_quiet_minutes {
+            return ScheduledAction::Idle {
+                reason: "repo not quiet long enough".to_string(),
+            };
+        }
+        if input.predicted_demand >= 0.15 {
+            return ScheduledAction::Idle {
+                reason: "predicted demand too high".to_string(),
+            };
+        }
+        if input.open_unlabelled_risky_pr {
+            return ScheduledAction::Idle {
+                reason: "open unlabelled risky PR present".to_string(),
+            };
+        }
     }
     if input.proactive_today_repo >= input.repo_daily_cap
         || input.proactive_today_fleet >= input.fleet_daily_cap

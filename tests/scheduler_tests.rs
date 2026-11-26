@@ -28,6 +28,7 @@ fn base_input() -> RepoScheduleInput {
         proactive_today_fleet: 0,
         fleet_daily_cap: 40,
         has_proactive_candidate: true,
+        is_explicit_full: false,
     }
 }
 
@@ -83,5 +84,18 @@ fn observe_mode_never_triggers() {
         risky_paths: true,
         created_at: "2026-11-22T14:00:00Z".parse().unwrap(),
     }];
+    assert!(matches!(decide(&input), ScheduledAction::Idle { .. }));
+}
+
+#[test]
+fn explicit_full_review_bypasses_quiet_and_runs_in_on_demand() {
+    let mut input = base_input();
+    input.mode = Mode::OnDemand;
+    input.quiet_for_minutes = 0;
+    input.is_explicit_full = true;
+    assert_eq!(decide(&input), ScheduledAction::TriggerProactive);
+
+    // Still never triggers in observe mode.
+    input.mode = Mode::Observe;
     assert!(matches!(decide(&input), ScheduledAction::Idle { .. }));
 }

@@ -5,6 +5,7 @@
 	let repos = $state<FleetRepoBudget[]>([]);
 	let loading = $state(true);
 	let error = $state<string | null>(null);
+	let togglingRepo = $state<string | null>(null);
 
 	async function load() {
 		try {
@@ -14,6 +15,23 @@
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
 			loading = false;
+		}
+	}
+
+	async function toggleProactive(r: FleetRepoBudget) {
+		if (togglingRepo) return;
+		togglingRepo = r.repo;
+		try {
+			await apiFetch(`/api/v1/repo/${r.owner}/${r.name}`, {
+				method: 'PATCH',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ proactive_enabled: !r.proactive_enabled })
+			});
+			await load();
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		} finally {
+			togglingRepo = null;
 		}
 	}
 
@@ -48,6 +66,7 @@
 						<th class="px-4 py-2.5">Queue</th>
 						<th class="px-4 py-2.5">Coverage</th>
 						<th class="px-4 py-2.5">Findings</th>
+						<th class="px-4 py-2.5">Proactive</th>
 					</tr>
 				</thead>
 				<tbody>
@@ -68,6 +87,17 @@
 							<td class="px-4 py-2.5">{r.queue_length}</td>
 							<td class="px-4 py-2.5">{r.coverage_pct.toFixed(0)}%</td>
 							<td class="px-4 py-2.5">{r.open_findings}</td>
+							<td class="px-4 py-2.5">
+								<button
+									class="px-2 py-0.5 text-xs rounded border border-[var(--border)] disabled:opacity-50"
+									class:text-emerald-500={r.proactive_enabled}
+									class:text-[var(--fg-muted)]={!r.proactive_enabled}
+									disabled={togglingRepo === r.repo}
+									onclick={() => toggleProactive(r)}
+								>
+									{r.proactive_enabled ? 'On' : 'Paused'}
+								</button>
+							</td>
 						</tr>
 					{/each}
 				</tbody>

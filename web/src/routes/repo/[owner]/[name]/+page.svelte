@@ -8,6 +8,8 @@
 	let prInput = $state('');
 	let prBusy = $state(false);
 	let fullBusy = $state(false);
+	let proactiveBusy = $state(false);
+	let queueBusy = $state(false);
 	let actionMsg = $state<string | null>(null);
 
 	const owner = $derived(page.params.owner);
@@ -63,6 +65,60 @@
 		}
 	}
 
+	async function toggleProactive() {
+		if (proactiveBusy || !detail) return;
+		const next = !detail.proactive_enabled;
+		proactiveBusy = true;
+		actionMsg = null;
+		try {
+			await apiFetch(`/api/v1/repo/${owner}/${name}`, {
+				method: 'PATCH',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ proactive_enabled: next })
+			});
+			actionMsg = next
+				? 'Automatic background proactive reviews enabled for this repo.'
+				: 'Automatic background proactive reviews paused (manual Full Repo Review still works).';
+			await load();
+		} catch (e) {
+			actionMsg = e instanceof Error ? e.message : String(e);
+		} finally {
+			proactiveBusy = false;
+		}
+	}
+
+	async function deleteQueueItem(id: number) {
+		if (queueBusy) return;
+		queueBusy = true;
+		actionMsg = null;
+		try {
+			await apiFetch(`/api/v1/queue/${id}`, { method: 'DELETE' });
+			actionMsg = `Removed queue entry #${id}.`;
+			await load();
+		} catch (e) {
+			actionMsg = e instanceof Error ? e.message : String(e);
+		} finally {
+			queueBusy = false;
+		}
+	}
+
+	async function clearWaitingQueue() {
+		if (queueBusy) return;
+		queueBusy = true;
+		actionMsg = null;
+		try {
+			const res = await apiFetch<{ deleted: number }>(`/api/v1/repo/${owner}/${name}/queue`, {
+				method: 'DELETE'
+			});
+			actionMsg = `Cleared ${res.deleted} waiting queue entry(s).`;
+			await load();
+		} catch (e) {
+			actionMsg = e instanceof Error ? e.message : String(e);
+		} finally {
+			queueBusy = false;
+		}
+	}
+
 	onMount(load);
 </script>
 
@@ -95,6 +151,15 @@
 			>
 				Full Repo Review
 			</button>
+			{#if detail}
+				<button
+					class="px-3 py-1 rounded border border-[var(--border)] hover:bg-[var(--bg-subtle)] disabled:opacity-50"
+					disabled={proactiveBusy}
+					onclick={toggleProactive}
+				>
+					Proactive: {detail.proactive_enabled ? 'On' : 'Paused'}
+				</button>
+			{/if}
 		</div>
 	</div>
 
@@ -132,6 +197,59 @@
 				<div class="text-xs text-[var(--fg-muted)]">Findings</div>
 				<div class="text-lg font-semibold mt-1">{detail.findings.length} recorded</div>
 			</div>
+		</section>
+
+		<section class="space-y-2">
+			<div class="flex items-center justify-between">
+				<h2 class="text-base font-semibold">Queue ({detail.queue.length})</h2>
+				{#if detail.queue.some((q) => q.state === 'waiting')}
+					<button
+						class="px-2.5 py-1 text-xs rounded border border-[var(--border)] hover:bg-[var(--bg-subtle)] disabled:opacity-50"
+						disabled={queueBusy}
+						onclick={clearWaitingQueue}
+					>
+						Clear Waiting
+					</button>
+				{/if}
+			</div>
+			{#if detail.queue.length === 0}
+				<p class="text-sm text-[var(--fg-muted)]">No queued reviews.</p>
+			{:else}
+				<div class="border border-[var(--border)] rounded overflow-x-auto">
+					<table class="w-full text-sm text-left">
+						<thead class="border-b border-[var(--border)] text-xs uppercase text-[var(--fg-muted)]">
+							<tr>
+								<th class="px-4 py-2">ID</th>
+								<th class="px-4 py-2">Kind</th>
+								<th class="px-4 py-2">PR</th>
+								<th class="px-4 py-2">State</th>
+								<th class="px-4 py-2">Queued</th>
+								<th class="px-4 py-2 text-right">Action</th>
+							</tr>
+						</thead>
+						<tbody>
+							{#each detail.queue as q (q.id)}
+								<tr class="border-b border-[var(--border)] last:border-b-0">
+									<td class="px-4 py-2 font-mono text-xs">#{q.id}</td>
+									<td class="px-4 py-2">{q.kind}</td>
+									<td class="px-4 py-2">{q.pr_number ? `#${q.pr_number}` : '—'}</td>
+									<td class="px-4 py-2">{q.state}</td>
+									<td class="px-4 py-2">{formatIrishTime(q.created_at)}</td>
+									<td class="px-4 py-2 text-right">
+										<button
+											class="px-2 py-0.5 text-xs rounded border border-[var(--border)] text-red-500 hover:bg-[var(--bg-subtle)] disabled:opacity-50"
+											disabled={queueBusy}
+											onclick={() => deleteQueueItem(q.id)}
+										>
+											Delete
+										</button>
+									</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				</div>
+			{/if}
 		</section>
 
 		<section class="space-y-2">
