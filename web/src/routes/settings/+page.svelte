@@ -6,14 +6,14 @@
 	let error = $state<string | null>(null);
 	let statusMsg = $state<string | null>(null);
 	let saving = $state(false);
-	let repoCap = $state('6');
-	let fleetCap = $state('40');
-	let quietMinutes = $state('45');
+	let repoCap = $state<number | undefined>(6);
+	let fleetCap = $state<number | undefined>(40);
+	let quietMinutes = $state<number | undefined>(45);
 
 	function syncInputs(s: Settings) {
-		repoCap = String(s.repo_daily_cap);
-		fleetCap = String(s.fleet_daily_cap);
-		quietMinutes = String(s.quiet_minutes);
+		repoCap = s.repo_daily_cap;
+		fleetCap = s.fleet_daily_cap;
+		quietMinutes = s.quiet_minutes;
 	}
 
 	async function load() {
@@ -50,13 +50,13 @@
 
 	async function saveCaps() {
 		if (saving) return;
-		const rCap = Number(repoCap.trim());
-		const fCap = Number(fleetCap.trim());
-		const qMin = Number(quietMinutes.trim());
+		const rCap = repoCap;
+		const fCap = fleetCap;
+		const qMin = quietMinutes;
 		if (
-			!Number.isSafeInteger(rCap) || rCap < 0 || rCap > 500 ||
-			!Number.isSafeInteger(fCap) || fCap < 0 || fCap > 500 ||
-			!Number.isSafeInteger(qMin) || qMin < 0 || qMin > 1440
+			typeof rCap !== 'number' || !Number.isSafeInteger(rCap) || rCap < 0 || rCap > 500 ||
+			typeof fCap !== 'number' || !Number.isSafeInteger(fCap) || fCap < 0 || fCap > 500 ||
+			typeof qMin !== 'number' || !Number.isSafeInteger(qMin) || qMin < 0 || qMin > 1440
 		) {
 			error = 'Caps must be integers 0–500 and quiet minutes 0–1440.';
 			return;

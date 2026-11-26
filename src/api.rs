@@ -413,20 +413,22 @@ async fn post_review_request(
     Json(req): Json<CreateReviewRequest>,
 ) -> Result<(StatusCode, Json<QueueRow>), (StatusCode, String)> {
     if req.full.unwrap_or(false) {
-        let cov_files = state
-            .db
-            .list_file_coverage(&req.repo)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let file_cap = state
+        let Some(tracked_repo) = state
             .db
             .list_repos()
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .into_iter()
             .find(|r| format!("{}/{}", r.owner, r.name) == req.repo)
-            .map(|r| usize::try_from(r.file_cap.max(1)).unwrap_or(50))
-            .unwrap_or(50);
+        else {
+            return Err((StatusCode::NOT_FOUND, "repository not tracked".to_string()));
+        };
+        let file_cap = usize::try_from(tracked_repo.file_cap.max(1)).unwrap_or(50);
+        let cov_files = state
+            .db
+            .list_file_coverage(&req.repo)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let batches = split_full_repo_batches(&cov_files, file_cap);
         if batches.is_empty() {

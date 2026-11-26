@@ -361,10 +361,15 @@ async fn run_scheduler_tick(
     let settings = db.get_settings().await?;
     let mode = Mode::parse(&settings.mode).unwrap_or(Mode::Observe);
     let mut repos = db.list_repos().await?;
+    let tracked_names: HashSet<String> = repos
+        .iter()
+        .map(|r| format!("{}/{}", r.owner, r.name))
+        .collect();
     let waiting_full_repos: HashSet<String> = db
         .list_repos_with_waiting_full()
         .await?
         .into_iter()
+        .filter(|r| tracked_names.contains(r))
         .collect();
     let has_waiting_full_fleet = !waiting_full_repos.is_empty();
     // Process repos with explicit Full Repo Review requests ahead of background proactive repos.
@@ -572,7 +577,12 @@ async fn run_scheduler_tick(
         let cov_files = db.list_file_coverage(&full).await?;
         let queued_choice = active
             .iter()
-            .filter(|q| q.state == "waiting" && (q.kind == "full" || q.kind == "proactive"))
+            .filter(|q| q.state == "waiting" && q.kind == "full")
+            .chain(
+                active
+                    .iter()
+                    .filter(|q| q.state == "waiting" && q.kind == "proactive"),
+            )
             .find_map(|q| {
                 let paths: Vec<String> = q
                     .paths_json
