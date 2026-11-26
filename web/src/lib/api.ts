@@ -12,6 +12,7 @@ export interface FleetRepoBudget {
 	queue_length: number;
 	coverage_pct: number;
 	open_findings: number;
+	proactive_enabled: boolean;
 }
 
 export interface SpendRow {
@@ -69,6 +70,7 @@ export interface CoverageSummary {
 export interface RepoDetail {
 	repo: string;
 	stars: number;
+	proactive_enabled: boolean;
 	budget: {
 		free: boolean;
 		remaining: number;

@@ -360,7 +360,23 @@ async fn run_scheduler_tick(
 ) -> Result<()> {
     let settings = db.get_settings().await?;
     let mode = Mode::parse(&settings.mode).unwrap_or(Mode::Observe);
-    let repos = db.list_repos().await?;
+    let mut repos = db.list_repos().await?;
+    let tracked_names: HashSet<String> = repos
+        .iter()
+        .map(|r| format!("{}/{}", r.owner, r.name))
+        .collect();
+    let waiting_full_repos: HashSet<String> = db
+        .list_repos_with_waiting_full()
+        .await?
+        .into_iter()
+        .filter(|r| tracked_names.contains(r))
+        .collect();
+    let has_waiting_full_fleet = !waiting_full_repos.is_empty();
+    // Process repos with explicit Full Repo Review requests ahead of background proactive repos.
+    repos.sort_by_key(|r| {
+        let full = format!("{}/{}", r.owner, r.name);
+        !waiting_full_repos.contains(&full)
+    });
     let now = Timestamp::now();
     let timeout_cutoff = now - SignedDuration::from_mins(15);
     let mut proactive_today_fleet = db.count_proactive_today(None, now).await?;
@@ -561,24 +577,36 @@ async fn run_scheduler_tick(
         let cov_files = db.list_file_coverage(&full).await?;
         let queued_choice = active
             .iter()
-            .filter(|q| q.state == "waiting" && (q.kind == "full" || q.kind == "proactive"))
+            .filter(|q| q.state == "waiting" && q.kind == "full")
+            .chain(
+                active
+                    .iter()
+                    .filter(|q| q.state == "waiting" && q.kind == "proactive"),
+            )
             .find_map(|q| {
                 let paths: Vec<String> = q
                     .paths_json
                     .as_deref()
                     .and_then(|s| serde_json::from_str(s).ok())
                     .unwrap_or_default();
-                batch_from_paths(&paths, &cov_files, q.kind == "full").map(|b| (Some(q.id), b))
+                let is_full = q.kind == "full";
+                batch_from_paths(&paths, &cov_files, is_full).map(|b| (Some(q.id), is_full, b))
             });
         let proactive_choice = queued_choice.or_else(|| {
+            if repo.proactive_enabled == 0 || has_waiting_full_fleet {
+                return None;
+            }
             select_proactive_batch(
                 &cov_files,
                 now,
                 usize::try_from(repo.file_cap.max(1)).unwrap_or(50),
                 2000,
             )
-            .map(|b| (None, b))
+            .map(|b| (None, false, b))
         });
+        let is_explicit_full = proactive_choice
+            .as_ref()
+            .is_some_and(|(_, is_full, _)| *is_full);
         let quiet_for_minutes = db.quiet_minutes_for_repo(&full, now).await?;
         let proactive_today_repo = db.count_proactive_today(Some(&full), now).await?;
 
@@ -598,6 +626,7 @@ async fn run_scheduler_tick(
             proactive_today_fleet,
             fleet_daily_cap: u32::try_from(settings.fleet_daily_cap.max(0)).unwrap_or(40),
             has_proactive_candidate: open_proactive_fleet == 0 && proactive_choice.is_some(),
+            is_explicit_full,
         };
 
         match decide(&input) {
@@ -673,7 +702,7 @@ async fn run_scheduler_tick(
                 debug!(repo = %full, %reason, "scheduler idle");
             }
             ScheduledAction::TriggerProactive => {
-                if let Some((queued_id, batch)) = proactive_choice {
+                if let Some((queued_id, _, batch)) = proactive_choice {
                     info!(
                         repo = %full,
                         area = %batch.area,
