@@ -1,0 +1,10 @@
+# WORKAROUND(jsonwebtoken): rust_crypto pulls rsa 0.9.10 / crypto-bigint 0.5.5; rsa 0.10 is not yet released for jsonwebtoken (upstream: Keats/jsonwebtoken#362).
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0071"
+ignoreUntil = 2027-02-09
+reason = "Marvin timing attack applies only to RSA decryption; coderabbit-steward only signs RS256 GitHub App JWTs."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0387"
+ignoreUntil = 2027-02-09
+reason = "Transitive via rsa 0.9.10 from jsonwebtoken rust_crypto; only used for RS256 JWT signing."
