@@ -88,6 +88,7 @@ pub struct GitHubPoller {
 impl GitHubPoller {
     pub fn new(config: Config, db: Db) -> Result<Self> {
         let client = reqwest::Client::builder()
+            .user_agent("coderabbit-steward/0.1")
             .timeout(Duration::from_secs(30))
             .build()?;
         Ok(Self {
